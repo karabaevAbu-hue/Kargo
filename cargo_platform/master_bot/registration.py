@@ -1,6 +1,7 @@
 """Регистрация карго и подключение бота (ТЗ, разделы 3.1–3.2)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -20,12 +21,38 @@ from cargo_platform.master_bot.common import (
     REMOVE, Connect, Reg, confirm_kb, lang_kb, main_menu, owner_company, phone_kb, skip_kb, slug, utcnow,
 )
 from cargo_platform.services.bot_manager import BotManager, make_bot, new_secret
-from cargo_platform.services.crypto import encrypt, sha256
+from cargo_platform.services.crypto import decrypt, encrypt, sha256
 from cargo_platform.services.validators import clean_phone, valid_company_name, valid_name, valid_token
 from cargo_platform.texts import all_variants, t
 
 log = logging.getLogger(__name__)
 router = Router(name="registration")
+_TASKS: set[asyncio.Task] = set()
+
+
+async def announce_new_bot(old_bot, company_id: int, new_username: str, owner_tg_id: int, master) -> int:
+    """Шлёт клиентам из СТАРОГО бота ссылку на новый. Возвращает, сколько получили."""
+    from cargo_platform.db.models import Client, ClientStatus
+    from cargo_platform.services import notify
+    async with Session() as s:
+        clients = list((await s.execute(select(Client).where(
+            Client.company_id == company_id, Client.status == ClientStatus.active,
+            Client.tg_id.is_not(None)))).scalars().all())
+    sent = 0
+    try:
+        for c in clients:
+            text = (f"ℹ️ Карго перешло на нового бота: https://t.me/{new_username}\n"
+                    "Откройте его — ваш код, посылки и долги сохранены.")
+            sent += await notify.send(old_bot, c.tg_id, text) == notify.OK
+        try:
+            await old_bot.delete_webhook()
+        except Exception:
+            pass     # токен старого бота мог быть уже отозван
+    finally:
+        await old_bot.session.close()
+    if master is not None:
+        await notify.send(master, owner_tg_id, f"📨 Клиентам старого бота отправлена ссылка на нового: {sent} из {len(clients)}.")
+    return sent
 
 
 async def _lang(state: FSMContext) -> str:
@@ -233,6 +260,11 @@ async def receive_token(message: Message, state: FSMContext, manager: BotManager
     finally:
         await probe.session.close()
 
+    async with Session() as s:
+        prev = await s.scalar(select(CompanyBot).where(CompanyBot.company_id == company_id))
+        prev_token = decrypt(prev.token_encrypted) if prev else None
+        prev_username = prev.bot_username if prev else None
+
     secret = new_secret()
     try:
         await manager.start(company_id, token, secret)
@@ -256,6 +288,12 @@ async def receive_token(message: Message, state: FSMContext, manager: BotManager
 
     await message.answer(t(lang, "token_deleted_note"))
     await message.answer(t(lang, "bot_connected", username=me.username))
+    if prev_token and prev_username != me.username:
+        # Владелец сменил бота: клиентам старого бота уходит ссылка на новый, пока старый ещё работает (ТЗ, раздел 9)
+        task = asyncio.create_task(announce_new_bot(make_bot(prev_token), company_id, me.username,
+                                                    message.from_user.id, manager.master))
+        _TASKS.add(task)
+        task.add_done_callback(_TASKS.discard)
 
     company = await owner_company(message.from_user.id)
     if company and company.settings and company.settings.setup_done:

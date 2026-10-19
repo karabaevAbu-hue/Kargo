@@ -214,8 +214,8 @@ async def test_flow():
     bot_b = manager._bots[b.id][0]
     await tenant_dp.feed_update(bot_a, upd(201, "/start"), company_id=a.id)
     await tenant_dp.feed_update(bot_b, upd(201, "/start"), company_id=b.id)
-    text_a = SESSIONS[t1].texts()[-1]
-    text_b = SESSIONS[t2].texts()[-1]
+    text_a = " ".join(SESSIONS[t1].texts())
+    text_b = " ".join(SESSIONS[t2].texts())
     check("Карго Альфа" in text_a and "280" in text_a and "Бета" not in text_a, "бот A показывает только данные A")
     check("Карго Бета" in text_b and "300" in text_b and "Альфа" not in text_b, "бот B показывает только данные B")
 

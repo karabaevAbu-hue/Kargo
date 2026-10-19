@@ -22,15 +22,12 @@ from cargo_platform.master_bot.common import (
 from cargo_platform.master_bot.settings import show_settings
 from cargo_platform.services.bot_manager import BotManager
 from cargo_platform.services.crypto import decrypt
+from cargo_platform.services.tariffs import PAID, staff_limit
 from cargo_platform.texts import all_variants, t
 
 router = Router(name="menu")
 
-TARIFFS = {  # ТЗ, 3.4
-    "start": ("Старт", 500, 3000, 2),
-    "business": ("Бизнес", 2000, 5000, 5),
-    "pro": ("Про", None, 8000, None),
-}
+TARIFFS = PAID  # ТЗ, 3.4
 STATUS_RU = {
     CompanyStatus.trial: "пробный период", CompanyStatus.active: "активна",
     CompanyStatus.grace: "льготный период", CompanyStatus.paused: "приостановлена (не оплачено)",
@@ -203,6 +200,13 @@ async def staff_invite(call: CallbackQuery):
     if not c or not c.bot:
         await call.message.answer("Сначала подключите бота.")
         return await call.answer()
+    limit = staff_limit(c.tariff)
+    async with Session() as s:
+        admins = await s.scalar(select(func.count()).select_from(Staff).where(
+            Staff.company_id == c.id, Staff.role == StaffRole.admin, Staff.active))
+    if limit is not None and admins >= limit:
+        await call.message.answer(f"На вашем тарифе максимум менеджеров: {limit}. Уберите кого-то или смените тариф («💳 Подписка»).")
+        return await call.answer()
     token = secrets.token_hex(8)
     async with Session() as s:
         s.add(StaffInvite(company_id=c.id, token=token, expires_at=utcnow() + timedelta(hours=24)))
@@ -273,9 +277,73 @@ async def platform(message: Message, manager: BotManager):
         lines.append(f"{bot} #{c.id} <b>{c.name}</b> — {STATUS_RU[c.status]}, {c.tariff}, до {as_utc(c.paid_until):%d.%m}, клиентов {counts.get(c.id, 0)}")
     lines.append(
         "\nКоманды:\n<code>/extend ID ДНЕЙ ТАРИФ СУММА</code> — продлить (тариф: start, business, pro)\n"
-        "<code>/block ID</code>, <code>/unblock ID</code>"
+        "<code>/block ID</code>, <code>/unblock ID</code>\n"
+        "<code>/purge ID</code> — удалить данные ушедшего карго (через 90 дней)"
     )
-    await message.answer("\n".join(lines))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📊 Статистика", callback_data="plat:stats"),
+        InlineKeyboardButton(text="⚠️ Журнал ошибок", callback_data="plat:errors"),
+    ]])
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
+@router.callback_query(F.data == "plat:stats")
+async def platform_stats(call: CallbackQuery):
+    """Только количества: персональных данных клиентов владелец платформы не видит (ТЗ, раздел 10)."""
+    if not is_platform_admin(call.from_user.id):
+        return await call.answer()
+    await call.answer()
+    from cargo_platform.db.models import Parcel
+    from cargo_platform.services.reports import period_start
+    day, month = period_start(1), period_start(1).replace(day=1)
+    async with Session() as s:
+        by_status = dict((await s.execute(select(Company.status, func.count()).group_by(Company.status))).all())
+        clients = await s.scalar(select(func.count()).select_from(Client))
+        p_day = await s.scalar(select(func.count()).select_from(Parcel).where(Parcel.created_at >= day))
+        p_month = await s.scalar(select(func.count()).select_from(Parcel).where(Parcel.created_at >= month))
+    await call.message.answer(
+        "📊 <b>Статистика платформы</b>\n\nКарго: " + ", ".join(f"{STATUS_RU[k]} — {v}" for k, v in by_status.items())
+        + f"\nКлиентов: {clients}\nПосылок за сегодня: {p_day}\nПосылок за месяц: {p_month}")
+
+
+@router.callback_query(F.data == "plat:errors")
+async def platform_errors(call: CallbackQuery):
+    if not is_platform_admin(call.from_user.id):
+        return await call.answer()
+    await call.answer()
+    from cargo_platform.db.models import ErrorLog
+    async with Session() as s:
+        rows = (await s.execute(select(ErrorLog, Company.name).outerjoin(Company, Company.id == ErrorLog.company_id)
+                                .order_by(ErrorLog.id.desc()).limit(20))).all()
+    if not rows:
+        return await call.message.answer("✅ Журнал ошибок пуст.")
+    await call.message.answer("⚠️ <b>Журнал ошибок ботов</b>\n\n" + "\n".join(
+        f"{e.created_at:%d.%m %H:%M} · {name or '—'} · {e.text[:120]}" for e, name in rows))
+
+
+@router.message(Command("purge"))
+async def purge_company(message: Message, command: CommandObject, manager: BotManager):
+    if not is_platform_admin(message.from_user.id):
+        return
+    from cargo_platform.services import purge
+    parts = (command.args or "").split()
+    try:
+        cid = int(parts[0])
+    except (IndexError, ValueError):
+        return await message.answer("Формат: /purge ID — проверка; /purge ID yes — удалить навсегда")
+    async with Session() as s:
+        c = await s.get(Company, cid)
+    if not c:
+        return await message.answer("Компания не найдена.")
+    reason = purge.can_purge(c)
+    if reason:
+        return await message.answer("Удалять нельзя. " + reason)
+    if parts[1:] != ["yes"]:
+        return await message.answer(f"Будут удалены ВСЕ данные «{c.name}» (клиенты, посылки, платежи). "
+                                    f"Убедитесь, что карго получило выгрузку. Подтвердить: /purge {cid} yes")
+    await manager.stop(cid)
+    await purge.purge(cid)
+    await message.answer(f"🗑 Данные «{c.name}» удалены.")
 
 
 @router.message(Command("extend"))

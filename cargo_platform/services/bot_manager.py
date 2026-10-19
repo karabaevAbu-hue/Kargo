@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 from cargo_platform.config import config
 from cargo_platform.db.base import Session
-from cargo_platform.db.models import BotStatus, Company, CompanyBot
+from cargo_platform.db.models import BotStatus, Company, CompanyBot, ErrorLog
 from cargo_platform.services.crypto import decrypt
 
 log = logging.getLogger(__name__)
@@ -48,6 +48,10 @@ class BotManager:
 
     def is_running(self, company_id: int) -> bool:
         return company_id in self._bots
+
+    def get_bot(self, company_id: int) -> Bot | None:
+        item = self._bots.get(company_id)
+        return item[0] if item else None
 
     async def start(self, company_id: int, token: str, secret: str) -> None:
         """Ставит webhook и регистрирует бота. Бросает TelegramUnauthorizedError при плохом токене."""
@@ -104,7 +108,8 @@ class BotManager:
             if row:
                 row.status = BotStatus.error
                 row.last_error = error[:1000]
-                await s.commit()
+            s.add(ErrorLog(company_id=company_id, text=error[:1000]))
+            await s.commit()
         await self.stop(company_id, delete_webhook=False)
         if notify and self.master and company:
             try:
@@ -144,5 +149,11 @@ class BotManager:
             await self.dp.feed_update(bot, update, company_id=company_id)
         except TelegramUnauthorizedError as e:
             await self.mark_error(company_id, f"Токен отозван: {e}")
-        except Exception:
+        except Exception as e:
             log.exception("Ошибка обработки обновления бота %s", company_id)
+            try:      # и в журнал ошибок раздела «Платформа»
+                async with Session() as s:
+                    s.add(ErrorLog(company_id=company_id, text=f"{type(e).__name__}: {e}"[:1000]))
+                    await s.commit()
+            except Exception:
+                log.exception("не удалось записать ошибку в журнал")

@@ -22,6 +22,17 @@ services:
     depends_on:
       - db
 
+  # Раз в 5 минут проверяет /health, при падении пишет Абу в Telegram (ТЗ, раздел 10)
+  monitor:
+    build: .
+    restart: always
+    env_file: .env
+    environment:
+      HEALTH_URL: http://app:8080/health
+    command: ["python", "-m", "cargo_platform.tools.monitor"]
+    depends_on:
+      - app
+
 volumes:
   pgdata:
   media:

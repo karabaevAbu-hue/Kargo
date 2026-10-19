@@ -131,6 +131,8 @@ class CompanySettings(Base):
     payment_text: Mapped[str | None] = mapped_column(Text)
     client_fields: Mapped[dict] = mapped_column(JSON, default=lambda: {"city": True})
     welcome_text: Mapped[str | None] = mapped_column(Text)
+    # False = склад не даёт данных: клиенту не шлём уведомления о статусах 1 и 2 (ТЗ, 5.1)
+    use_china_statuses: Mapped[bool] = mapped_column(Boolean, default=True)
     setup_done: Mapped[bool] = mapped_column(Boolean, default=False)
 
     company: Mapped[Company] = relationship(back_populates="settings")
@@ -242,6 +244,7 @@ class Parcel(Base):
     places: Mapped[int] = mapped_column(Integer, default=1)
     description: Mapped[str | None] = mapped_column(String(200))
     status: Mapped[ParcelStatus] = mapped_column(Enum(ParcelStatus), default=ParcelStatus.expected)
+    problem_note: Mapped[str | None] = mapped_column(String(200))   # причина «Проблема» / «клиент удалён»
     arrived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     issued_by: Mapped[int | None] = mapped_column(ForeignKey("staff.id"))
@@ -310,7 +313,8 @@ class Broadcast(Base):
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent: Mapped[int] = mapped_column(Integer, default=0)
     failed: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(12), default="draft")
+    status: Mapped[str] = mapped_column(String(12), default="draft")   # draft / scheduled / sending / done
+    created_at: Mapped[datetime] = now_col()
 
 
 class AuditLog(Base):
@@ -323,4 +327,26 @@ class AuditLog(Base):
     object: Mapped[str | None] = mapped_column(String(100))
     old_value: Mapped[str | None] = mapped_column(Text)
     new_value: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = now_col()
+
+
+class NoticeLog(Base):
+    """Какие напоминания уже отправлены (чтобы не слать дважды). client_id=0 — владельцу."""
+    __tablename__ = "notice_log"
+    __table_args__ = (UniqueConstraint("company_id", "client_id", "key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int] = mapped_column(Integer, index=True)
+    client_id: Mapped[int] = mapped_column(Integer, default=0)
+    key: Mapped[str] = mapped_column(String(60))
+    created_at: Mapped[datetime] = now_col()
+
+
+class ErrorLog(Base):
+    """Журнал ошибок ботов для раздела «Платформа» (токен отозван, бот заблокирован)."""
+    __tablename__ = "error_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    company_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = now_col()

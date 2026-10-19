@@ -44,6 +44,9 @@ class Config:
     trial_days: int = int(os.getenv("TRIAL_DAYS", "14"))
     grace_days: int = int(os.getenv("GRACE_DAYS", "3"))
     support_username: str = os.getenv("SUPPORT_USERNAME", "")
+    # Часовой пояс карго для отчёта дня и рассылок «на время»: Бишкек = UTC+6
+    tz_offset_hours: int = int(os.getenv("TZ_OFFSET_HOURS", "6"))
+    daily_report_hour: int = int(os.getenv("DAILY_REPORT_HOUR", "20"))
 
 
 config = Config()

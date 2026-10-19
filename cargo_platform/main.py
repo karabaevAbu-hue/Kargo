@@ -17,7 +17,7 @@ from cargo_platform.client_bot.handlers import router as client_router
 from cargo_platform.config import config
 from cargo_platform.db.base import init_db
 from cargo_platform.master_bot import menu, registration, settings
-from cargo_platform.services import subscriptions
+from cargo_platform.services import maintenance, subscriptions
 from cargo_platform.services.bot_manager import BotManager, make_bot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -33,6 +33,8 @@ def build_app() -> web.Application:
     master_dp = Dispatcher(storage=MemoryStorage())
     master_dp.include_routers(registration.router, settings.router, menu.router)
 
+    # MemoryStorage ключует состояния по bot_id: один человек может быть клиентом в нескольких карго без путаницы.
+    # При переходе на Redis: RedisStorage(..., key_builder=DefaultKeyBuilder(with_bot_id=True))
     tenant_dp = Dispatcher(storage=MemoryStorage())
     tenant_dp.include_router(client_router)
 
@@ -51,6 +53,7 @@ def build_app() -> web.Application:
         )
         await manager.start_all()
         bg_tasks.append(asyncio.create_task(subscriptions.loop(master_bot)))
+        bg_tasks.append(asyncio.create_task(maintenance.loop(manager)))
         log.info("Сервер запущен: %s", config.base_url)
 
     async def on_shutdown(_: Dispatcher):

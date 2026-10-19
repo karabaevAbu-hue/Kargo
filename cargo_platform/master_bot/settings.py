@@ -21,7 +21,7 @@ from cargo_platform.master_bot.common import (
     REMOVE, SettingsFSM, cancel_kb, main_menu, owner_company, skip_kb,
 )
 from cargo_platform.services.validators import (
-    clean_phone, format_code, has_code_placeholder, normalize_template, parse_decimal, valid_prefix,
+    format_code, has_code_placeholder, normalize_template, parse_decimal, valid_prefix,
 )
 from cargo_platform.texts import all_variants, t
 
@@ -98,7 +98,7 @@ class Field:
     optional: bool = False
 
 
-FIELDS: list[Field] = [
+WIZARD_FIELDS: list[Field] = [
     Field("code_prefix", "Префикс кода", "🔤 Префикс кода клиентов: 2–5 латинских букв. Например <code>OSH</code> → коды OSH-0001, OSH-0002…", _prefix),
     Field("code_next_number", "Первый номер кода", "🔢 С какого номера начинать коды? Обычно 1. Если у вас уже есть клиенты с кодами до 350, введите 351.", _start_number),
     Field("address_taobao", "Адрес Taobao / 1688", "🇨🇳 Адрес склада для Taobao / 1688. Вместо кода клиента напишите <code>{CODE}</code>, бот подставит его сам.\nПример: <code>广东省广州市白云区XX路XX号 {CODE}</code>", _address),
@@ -113,7 +113,22 @@ FIELDS: list[Field] = [
     Field("forbidden_text", "Запрещённые товары", "⛔ Список запрещённых товаров (текстом, как покажете клиентам):", _short_text(3000)),
     Field("payment", "Реквизиты оплаты", "💳 Пришлите картинку QR бизнес-счёта (можно с подписью: банк, получатель) или текст с реквизитами для перевода:", None),
 ]
+# Необязательные настройки: в мастере их нет, меняются потом из меню «Настройки»
+FIELDS: list[Field] = WIZARD_FIELDS + [
+    Field("welcome_text", "Приветствие клиента", "👋 Текст приветствия для клиентов (показывается при регистрации). Можно пропустить — будет стандартное.", _short_text(500), optional=True),
+]
 FIELD_BY_KEY = {f.key: f for f in FIELDS}
+
+TOGGLES = {   # ключ: (название, где хранится)
+    "city": ("Спрашивать город у клиента", "client_fields"),
+    "delivery_address": ("Спрашивать адрес доставки", "client_fields"),
+    "china": ("Уведомлять о статусах «Склад Китая» и «Отправлено»", "use_china_statuses"),
+}
+
+
+def _toggle_on(st: CompanySettings, key: str) -> bool:
+    where = TOGGLES[key][1]
+    return bool(st.use_china_statuses) if where == "use_china_statuses" else bool((st.client_fields or {}).get(key))
 
 
 def _show(s: CompanySettings, f: Field) -> str:
@@ -144,7 +159,7 @@ async def _ask(message: Message, state: FSMContext, field: Field, lang: str, sin
 async def start_wizard(message: Message, state: FSMContext, company_id: int, lang: str):
     await state.set_data({"lang": lang, "company_id": company_id, "idx": 0, "single": False})
     await state.set_state(SettingsFSM.value)
-    await message.answer("⚙️ Настройка компании: 13 коротких вопросов.")
+    await message.answer(f"⚙️ Настройка компании: {len(WIZARD_FIELDS)} коротких вопросов.")
     await _ask(message, state, FIELDS[0], lang, single=False)
 
 
@@ -164,7 +179,7 @@ async def _next(message: Message, state: FSMContext):
         await message.answer(t(lang, "saved"), reply_markup=main_menu(lang, message.from_user.id))
         return await show_settings(message, company.id)
     idx = d["idx"] + 1
-    if idx < len(FIELDS):
+    if idx < len(WIZARD_FIELDS):
         await state.update_data(idx=idx)
         return await _ask(message, state, FIELDS[idx], lang, single=False)
     # мастер закончен
@@ -260,7 +275,11 @@ async def show_settings(message: Message, company_id: int):
     lines += [f"• {f.title}: {_show(st, f)}" for f in FIELDS]
     if st.code_prefix:
         lines.append(f"\nСледующий код клиента: <b>{format_code(st.code_prefix, st.code_next_number, st.code_digits)}</b>")
+    lines.append("")
+    lines += [f"{'🟢' if _toggle_on(st, k) else '⚪'} {title}" for k, (title, _) in TOGGLES.items()]
     buttons = [[InlineKeyboardButton(text=f"✏️ {f.title}", callback_data=f"set:{f.key}")] for f in FIELDS]
+    buttons += [[InlineKeyboardButton(text=f"{'🟢' if _toggle_on(st, k) else '⚪'} {title}", callback_data=f"tg:{k}")]
+                for k, (title, _) in TOGGLES.items()]
     await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
                          disable_web_page_preview=True)
 
@@ -276,3 +295,22 @@ async def edit_one(call: CallbackQuery, state: FSMContext):
     await state.set_state(SettingsFSM.value)
     await _ask(call.message, state, FIELDS[idx], company.lang, single=True)
     await call.answer()
+
+
+@router.callback_query(F.data.startswith("tg:"))
+async def toggle(call: CallbackQuery):
+    company = await owner_company(call.from_user.id)
+    key = call.data.split(":", 1)[1]
+    if not company or key not in TOGGLES:
+        return await call.answer()
+    async with Session() as s:
+        st = await s.get(CompanySettings, company.id)
+        if TOGGLES[key][1] == "use_china_statuses":
+            st.use_china_statuses = not st.use_china_statuses
+        else:
+            fields = dict(st.client_fields or {})
+            fields[key] = not fields.get(key)
+            st.client_fields = fields
+        await s.commit()
+    await call.answer("Сохранено")
+    await show_settings(call.message, company.id)

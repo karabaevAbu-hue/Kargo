@@ -45,6 +45,9 @@ async def check_once(master: Bot) -> None:
             elif new != c.status and new == CompanyStatus.paused:
                 key = f"paused:{until:%Y%m%d}"
                 text = "⛔ Бот для клиентов приостановлен: подписка не оплачена. Данные хранятся 90 дней."
+            elif new in (CompanyStatus.trial, CompanyStatus.active) and until - now <= timedelta(days=1):
+                key = f"end:{until:%Y%m%d}"
+                text = f"🔔 Подписка заканчивается сегодня-завтра ({until:%d.%m.%Y}). Продлите её в разделе «💳 Подписка»."
             elif new in (CompanyStatus.trial, CompanyStatus.active) and until - now <= timedelta(days=3):
                 key = f"pre3:{until:%Y%m%d}"
                 text = f"🔔 Подписка заканчивается {until:%d.%m.%Y}. Откройте «💳 Подписка», чтобы продлить."
