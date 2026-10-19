@@ -1,0 +1,6 @@
+aiogram>=3.13,<4
+SQLAlchemy>=2.0,<3
+aiosqlite>=0.20
+asyncpg>=0.29
+cryptography>=42
+greenlet>=3

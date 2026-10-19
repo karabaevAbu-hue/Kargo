@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: cargo
+      POSTGRES_USER: cargo
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  app:
+    build: .
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://cargo:${POSTGRES_PASSWORD}@db:5432/cargo
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - media:/app/media
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
+  media:
