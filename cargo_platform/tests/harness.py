@@ -11,7 +11,8 @@ _tmp = tempfile.mkdtemp()
 os.environ.update({
     "MASTER_BOT_TOKEN": "111111:" + "M" * 35,
     "BASE_URL": "https://test.example",
-    "DATABASE_URL": f"sqlite+aiosqlite:///{_tmp}/test.db",
+    # TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host/db — прогон на PostgreSQL; по умолчанию SQLite
+    "DATABASE_URL": os.environ.get("TEST_DATABASE_URL") or f"sqlite+aiosqlite:///{_tmp}/test.db",
     "FERNET_KEY": "pXlyrCqA2ZcOfnS7yp2c9N2VjfV5lW3l8Vh3X0bHk0c=",
     "PLATFORM_ADMINS": "999",
     "TZ_OFFSET_HOURS": "6",
@@ -29,6 +30,7 @@ from aiogram.methods import (  # noqa: E402
 from aiogram.types import Chat, File, Message, Update, User  # noqa: E402
 
 from cargo_platform.client_bot.handlers import router as client_router  # noqa: E402
+from cargo_platform.tests.dbutil import fresh_db  # noqa: E402
 from cargo_platform.master_bot import menu, registration, settings  # noqa: E402
 from cargo_platform.services import bot_manager as bm  # noqa: E402
 
@@ -172,9 +174,10 @@ async def register_company(master_dp, master, owner_id, name, token, prefix, pri
 class World:
     """Две карго, главный бот и оба диспетчера."""
 
+    prefixes = {"A": "osh", "B": "kg"}
+
     async def setup(self):
-        from cargo_platform.db.base import init_db
-        await init_db()
+        await fresh_db()
         self.master_session = FakeSession(username="master_bot", bot_id=1)
         self.master = Bot("111111:" + "M" * 35, session=self.master_session,
                           default=DefaultBotProperties(parse_mode="HTML"))
@@ -186,8 +189,8 @@ class World:
         self.manager.master = self.master
         self.master_dp["manager"] = self.manager
         self.tokens = {"A": "222222:" + "A" * 35, "B": "333333:" + "B" * 35}
-        await register_company(self.master_dp, self.master, 101, "Карго Альфа", self.tokens["A"], "osh", 280)
-        await register_company(self.master_dp, self.master, 102, "Карго Бета", self.tokens["B"], "kg", 300)
+        await register_company(self.master_dp, self.master, 101, "Карго Альфа", self.tokens["A"], self.prefixes["A"], 280)
+        await register_company(self.master_dp, self.master, 102, "Карго Бета", self.tokens["B"], self.prefixes["B"], 300)
         from sqlalchemy import select
         from cargo_platform.db.base import Session
         from cargo_platform.db.models import Company

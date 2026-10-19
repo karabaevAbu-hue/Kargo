@@ -253,7 +253,8 @@ def analyze(rows: list[list[str]], mapping: dict[str, int], header: bool, ctx: C
         else:
             number = int(code.split("-")[1])
             row.note = "клиент удалён" if number < ctx.next_number else "такой код не выдан"
-        row.suggestions = suggest_codes(row.raw_code, codes)
+        if foreign_prefix or code is None:     # для «код не выдан» подсказки только запутывают
+            row.suggestions = suggest_codes(row.raw_code, codes)
     return Analysis(rows=result)
 
 

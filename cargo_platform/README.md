@@ -54,41 +54,37 @@ cargo_platform/
   tests/                   # test_week1, test_full, run_all
 ```
 
-## Запуск на MacBook (для теста)
+## Тест на MacBook
+
+Пошаговая инструкция для человека без опыта в терминале: [`docs/MACBOOK_SETUP.md`](docs/MACBOOK_SETUP.md).
+Что нажимать в Telegram и что должно произойти: [`docs/LIVE_TEST_CHECKLIST.md`](docs/LIVE_TEST_CHECKLIST.md).
+Тестовый файл склада на 20 строк: `testdata/sklad_test_20.xlsx` (пересоздать: `python -m cargo_platform.tools.make_test_excel`).
+
+## Запуск на MacBook (краткая версия)
 
 Telegram отправляет обновления только на HTTPS-адрес, поэтому на ноутбуке
 нужен туннель. Проще всего — cloudflared.
 
 ```bash
-# 1. Папка проекта: положите cargo_platform в любую папку, например ~/cargo
-cd ~/cargo
-python3 -m venv venv && source venv/bin/activate
+cd ~/cargo && python3.12 -m venv venv && source venv/bin/activate
 pip install -r cargo_platform/requirements.txt
-
-# 2. Ключ шифрования
-python -m cargo_platform.tools.genkey      # скопируйте строку в FERNET_KEY
-
-# 3. Туннель (в отдельном окне терминала)
-brew install cloudflared
-cloudflared tunnel --url http://localhost:8080
-#   он покажет адрес вида https://xxxx.trycloudflare.com → это BASE_URL
-
-# 4. Настройки
-cp cargo_platform/.env.example cargo_platform/.env
-#   заполните MASTER_BOT_TOKEN, BASE_URL, FERNET_KEY, MASTER_WEBHOOK_SECRET, PLATFORM_ADMINS
-
-# 5. Запуск
-python -m cargo_platform.main
+docker compose -f cargo_platform/docker-compose.dev.yml up -d      # PostgreSQL (или добавьте --sqlite к make_env ниже)
+cloudflared tunnel --url http://localhost:8080                      # в отдельном окне: выдаст https://xxxx.trycloudflare.com
+python -m cargo_platform.tools.make_env                             # спросит токен, ваш Telegram ID и адрес туннеля
+sh cargo_platform/tools/dev_run.sh                                  # миграции + запуск
 ```
 
-Адрес trycloudflare меняется при каждом запуске туннеля: обновите BASE_URL и
-перезапустите программу, она сама переставит webhook всех ботов.
+Адрес trycloudflare меняется при каждом запуске туннеля: `python -m cargo_platform.tools.make_env --base-url НОВЫЙ_АДРЕС`
+и перезапуск — программа сама переставит webhook всех ботов.
 
 ## Проверка
 
 ```bash
-python -m cargo_platform.tests.run_all     # 185 проверок без Telegram
+python -m cargo_platform.tests.run_all     # 222 проверки без Telegram
 ```
+
+Тесты можно прогнать на PostgreSQL: `TEST_DATABASE_URL=postgresql+asyncpg://cargo:cargo@localhost:5432/cargo_test python -m cargo_platform.tests.run_all`
+(тестовая база будет очищена!).
 
 `test_full` проходит весь цикл: регистрация клиента → трек → Excel склада → отправка и прибытие партии →
 оплата (полная, частичная, отказ, наличные) → выдача → правка веса → неопознанные → рассылка → отчёты →
@@ -101,7 +97,7 @@ python -m cargo_platform.tests.run_all     # 185 проверок без Telegra
    проксировать `https://домен` → `http://127.0.0.1:8080`.
 3. Скопировать папку `cargo_platform` на сервер, заполнить `.env`
    (BASE_URL = `https://домен`, задать POSTGRES_PASSWORD).
-4. `docker compose up -d --build`
+4. `docker compose up -d --build` (миграции применяются автоматически при старте контейнера `app`)
 5. Проверка: `curl https://домен/health` → `ok`.
 
 **Бэкап каждую ночь** (`crontab -e`):
@@ -123,9 +119,10 @@ python -m cargo_platform.tests.run_all     # 185 проверок без Telegra
 - Файл `.env` никогда не загружать в GitHub.
 - Состояния диалогов пока в памяти: при перезапуске человек, который был
   посреди регистрации, начнёт шаг заново через /start. При росте — Redis.
-- Таблицы создаются через `create_all`. В этой версии добавились таблицы и колонки (`notice_log`, `error_log`,
-  `use_china_statuses`, `problem_note`, `broadcasts.created_at`): базу первой недели пересоздайте (боевых данных
-  там ещё нет). Миграции Alembic из ТЗ ещё не подключены — подключить до первого живого карго.
+- Таблицы создаются **только миграциями Alembic** (`python -m cargo_platform.tools.migrate`); сервер не стартует на базе
+  без миграций и подсказывает команду. Изменили модели — `cd cargo_platform && alembic revision --autogenerate -m "что изменилось"`
+  (с `PYTHONPATH` на папку выше), тест `test_migrations` проверяет, что миграции совпадают с моделями.
+  Если у вас осталась база, созданная до Alembic, — пересоздайте её (боевых данных ещё нет).
 - Кыргызский перевод — черновик, дайте проверить носителю. Админка менеджера только на русском.
 - Чтение штрихкодов по фото требует `libzbar0` (в Docker-образе есть); без него бот просит ввести значение вручную.
 

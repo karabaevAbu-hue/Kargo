@@ -1,0 +1,22 @@
+# Только база данных — для теста на ноутбуке. Сам бот запускается обычной командой из venv.
+#   docker compose -f cargo_platform/docker-compose.dev.yml up -d
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cargo
+      POSTGRES_USER: cargo
+      POSTGRES_PASSWORD: cargo
+    ports:
+      - "127.0.0.1:5432:5432"      # доступна только с вашего компьютера
+    volumes:
+      - cargo_dev_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cargo -d cargo"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  cargo_dev_pgdata:

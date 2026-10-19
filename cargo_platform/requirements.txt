@@ -9,3 +9,4 @@ xlrd>=2.0
 qrcode>=7.4
 Pillow>=10
 pyzbar>=0.1.9
+alembic>=1.13

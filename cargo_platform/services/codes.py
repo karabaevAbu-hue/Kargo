@@ -54,17 +54,11 @@ def suggest_codes(raw, codes: list[str], limit: int = 3) -> list[str]:
     if not text:
         return []
     digits = re.sub(r"\D", "", text)
-    out: list[str] = []
-    if digits:
-        n = int(digits)
-        out += [c for c in codes if int(re.sub(r"\D", "", c)) == n]
-    out += difflib.get_close_matches(text, codes, n=limit, cutoff=0.7)
-    seen, res = set(), []
-    for c in out:
-        if c not in seen:
-            seen.add(c)
-            res.append(c)
-    return res[:limit]
+    if digits:       # тот же номер с другим префиксом — самая вероятная опечатка
+        same = [c for c in codes if int(re.sub(r"\D", "", c)) == int(digits)]
+        if same:
+            return same[:limit]
+    return difflib.get_close_matches(text, codes, n=limit, cutoff=0.85)
 
 
 async def find_client_by_code(s: AsyncSession, company_id: int, raw: str, prefix: str,

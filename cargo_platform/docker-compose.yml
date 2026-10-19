@@ -8,6 +8,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cargo -d cargo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   app:
     build: .
@@ -15,12 +20,15 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://cargo:${POSTGRES_PASSWORD}@db:5432/cargo
+    # сначала миграции Alembic (создают и обновляют таблицы), потом сервер
+    command: ["sh", "-c", "python -m cargo_platform.tools.migrate && python -m cargo_platform.main"]
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
       - media:/app/media
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
   # Раз в 5 минут проверяет /health, при падении пишет Абу в Telegram (ТЗ, раздел 10)
   monitor:

@@ -15,7 +15,7 @@ from aiohttp import web
 
 from cargo_platform.client_bot.handlers import router as client_router
 from cargo_platform.config import config
-from cargo_platform.db.base import init_db
+from cargo_platform.db.base import check_schema
 from cargo_platform.master_bot import menu, registration, settings
 from cargo_platform.services import maintenance, subscriptions
 from cargo_platform.services.bot_manager import BotManager, make_bot
@@ -45,7 +45,7 @@ def build_app() -> web.Application:
     bg_tasks: list[asyncio.Task] = []
 
     async def on_startup(_: Dispatcher):
-        await init_db()
+        await check_schema()
         await master_bot.set_webhook(
             f"{config.base_url}/master",
             secret_token=config.master_secret,

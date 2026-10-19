@@ -20,7 +20,7 @@ _tmp = tempfile.mkdtemp()
 os.environ.update({
     "MASTER_BOT_TOKEN": "111111:" + "M" * 35,
     "BASE_URL": "https://test.example",
-    "DATABASE_URL": f"sqlite+aiosqlite:///{_tmp}/test.db",
+    "DATABASE_URL": os.environ.get("TEST_DATABASE_URL") or f"sqlite+aiosqlite:///{_tmp}/test.db",
     "FERNET_KEY": "pXlyrCqA2ZcOfnS7yp2c9N2VjfV5lW3l8Vh3X0bHk0c=",
     "PLATFORM_ADMINS": "999",
 })
@@ -34,7 +34,7 @@ from aiogram.types import Chat, Message, Update, User  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 from cargo_platform.client_bot.handlers import router as client_router  # noqa: E402
-from cargo_platform.db.base import Session, init_db  # noqa: E402
+from cargo_platform.db.base import Session  # noqa: E402
 from cargo_platform.db.models import (  # noqa: E402
     Company, CompanyBot, CompanySettings, CompanyStatus, Staff, StaffInvite,
 )
@@ -168,7 +168,8 @@ async def register_company(master_dp, master, owner_id, name, token, prefix, pri
 
 
 async def test_flow():
-    await init_db()
+    from cargo_platform.tests.dbutil import fresh_db  # noqa: E402
+    await fresh_db()
     master_session = FakeSession(username="master_bot", bot_id=1)
     master = Bot("111111:" + "M" * 35, session=master_session, default=DefaultBotProperties(parse_mode="HTML"))
     master_dp = Dispatcher(storage=MemoryStorage())
