@@ -48,7 +48,7 @@ class Settings:
     bot_token: str = ""
     allowed_user_ids: frozenset[int] = frozenset()
     webhook_secret: str = ""
-    mode: str = "A"  # A — TradingView-вебхуки, B — свой расчёт (Twelve Data), BOTH
+    mode: str = "B"  # B — свой расчёт (Twelve Data, основной сейчас), A — вебхуки TradingView (платный тариф), BOTH
     db_path: str = "data/xau_engine.sqlite3"
     host: str = "0.0.0.0"
     port: int = 8080
@@ -85,7 +85,7 @@ class Settings:
 def load_settings(dotenv: str | Path | None = ".env") -> Settings:
     if dotenv:
         _load_dotenv(Path(dotenv))
-    mode = (_env("MODE", "A") or "A").upper()
+    mode = (_env("MODE", "B") or "B").upper()
     if mode not in ("A", "B", "BOTH"):
         raise ValueError("MODE должен быть A, B или BOTH")
     rr_raw = (_env("MIN_RR", "2") or "2").strip().lower()

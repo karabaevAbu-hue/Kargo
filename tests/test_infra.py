@@ -271,7 +271,10 @@ def test_settings_from_env_and_defaults(monkeypatch, tmp_path):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.delenv("DAY_OPEN_UTC_HOUR", raising=False)
     cfg = load_settings(None)
-    assert cfg.params.day_open_utc_hour == 21
+    assert cfg.mode == "B" and cfg.params.day_open_utc_hour == 0  # основной режим сейчас — B (Twelve Data)
+    monkeypatch.setenv("MODE", "A")
+    assert load_settings(None).params.day_open_utc_hour == 21  # OANDA
+    monkeypatch.delenv("MODE")
     assert (cfg.params.point_size, cfg.params.zone_target, cfg.params.zone_max) == (1.0, 5.0, 10.0)
     assert (cfg.params.sl_buffer, cfg.params.sl_max, cfg.params.min_rr, cfg.max_signals_day) == (1.5, 20.0, 2.0, 3)
     assert (cfg.params.doji_body_ratio, cfg.params.perfect_double_tol, cfg.params.big_imbalance) == (0.10, 0.5, 3.0)
