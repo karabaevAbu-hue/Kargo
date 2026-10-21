@@ -1,0 +1,785 @@
+//@version=6
+// ============================================================================
+// Mr. Casino — OB + FU + HCS  (XAU Engine Pro)
+// Ставить на OANDA:XAUUSD, таймфрейм M5. Шлёт JSON-алерты на вебхук сервера.
+//
+// Как подключить:
+//   1) Добавь индикатор на график OANDA:XAUUSD, M5.
+//   2) Создай алерт: Условие = этот индикатор, "Любой вызов alert()"
+//      (Any alert() function call), Webhook URL = https://<сервер>/webhook/tradingview
+//      (вебхуки работают только на платном тарифе TradingView).
+//   3) В настройках индикатора задай тот же секрет, что WEBHOOK_SECRET на сервере.
+//
+// Что умеет: Bias (W/D1/H4), OB на H1/H4/D1/W (odd-свеча + FU), статус зоны
+// NEW/CONFIRMED, манипуляции в зоне (FU, FU re-test, HCS x2/x3, Negation) на M5/M15/M30/H1,
+// True Stop и зона <= 10 пунктов (цель 5), SL, TP1-TP3 по major-ликвидности,
+// цикл манипуляции (точки 1-3), события: ZONE / ENTRY / TP1-3 / SL / CANCEL.
+//
+// Отличия от Python-движка сервера (вариант B, там реализовано всё полностью):
+//   - FU после OB ищется только на следующей свече;
+//   - типы FU (SFU/AFU/BIW) не ранжируются: сила считается по HCS / Negation / re-test / FU;
+//   - нет уровней ретеста HTF-пары Doji + большая свеча (Level #1-#4) и фильтра «из имбаланса»;
+//   - Doji-цели без правила «внутри тела соседней свечи»; трендовая линия: 3 последних пивота.
+//   - нет проверки «точка 3 уже была до отправки сигнала» (сервер B её делает);
+//   - одновременно ведётся один активный сигнал.
+// ВАЖНО: скрипт написан без доступа к компилятору TradingView. Первый запуск может
+// потребовать мелких правок синтаксиса. Расчёт сервера (Python) покрыт тестами.
+// ============================================================================
+indicator("Mr. Casino — OB + FU + HCS", shorttitle="MC XAU Engine", overlay=true, max_boxes_count=50, max_lines_count=50, max_labels_count=50, max_bars_back=1000)
+
+// ----------------------------------------------------------------- входные параметры
+grpS = "Сервер"
+i_secret   = input.string("", "Секрет вебхука (WEBHOOK_SECRET)", group=grpS)
+i_feed     = input.string("OANDA", "Подпись фида", group=grpS)
+i_live     = input.bool(true, "Слать алерты только на живых барах", group=grpS)
+
+grpZ = "Зона и риск (в пунктах)"
+i_pt       = input.float(1.0, "Пункт = $ цены золота (POINT_SIZE)", minval=0.01, group=grpZ)
+i_zTarget  = input.float(5.0, "ZONE_TARGET", minval=0.5, group=grpZ)
+i_zMax     = input.float(10.0, "ZONE_MAX", minval=1.0, group=grpZ)
+i_minW     = input.float(1.0, "Минимальная ширина зоны", minval=0.1, group=grpZ)
+i_slBuf    = input.float(1.5, "SL_BUFFER", minval=0.0, group=grpZ)
+i_slMax    = input.float(20.0, "SL_MAX", minval=1.0, group=grpZ)
+i_minRR    = input.float(2.0, "MIN_RR до TP1 (0 — выкл)", minval=0.0, group=grpZ)
+i_maxDay   = input.int(3, "MAX_SIGNALS_DAY", minval=1, group=grpZ)
+i_maxDist  = input.float(60.0, "Макс. расстояние от цены до зоны, п.", minval=1.0, group=grpZ)
+
+grpC = "Пороги свечей (в слайдах не заданы)"
+i_dojiR    = input.float(0.10, "Doji: тело / диапазон", minval=0.0, maxval=1.0, group=grpC)
+i_bigWick  = input.float(0.50, "Большая тень: доля диапазона", minval=0.0, maxval=1.0, group=grpC)
+i_dblTol   = input.float(0.5, "Идеальная двойная вершина: разница, п.", minval=0.0, group=grpC)
+i_gap      = input.float(3.0, "Крупный имбаланс (FVG), п.", minval=0.1, group=grpC)
+i_obWick   = input.float(0.25, "OB: доля теней odd-свечи", minval=0.0, maxval=1.0, group=grpC)
+i_dispAtr  = input.float(1.0, "OB: импульс в ATR", minval=0.0, group=grpC)
+i_ttlEnd   = input.int(23, "Сигнал действует до (час, Бишкек)", minval=1, maxval=23, group=grpC)
+
+grpV = "Отображение"
+i_draw     = input.bool(true, "Рисовать зону, SL и TP", group=grpV)
+
+// ----------------------------------------------------------------- общие функции
+f_px(float pts) => pts * i_pt
+
+// Свеча [1] относительно [2], [3] в бычьей ориентации (s = 1) или зеркальной (s = -1).
+// Возвращает событие манипуляции на последней закрытой свече контекста:
+// kind: 0 нет, 1 FU, 2 FU re-test, 3 Negation, 4 HCS. Цены возвращаются в исходной системе.
+f_ev_side(int s) =>
+    float o1 = s * open[1]
+    float c1 = s * close[1]
+    float l1 = s > 0 ? low[1] : -high[1]
+    float o2 = s * open[2]
+    float c2 = s * close[2]
+    float l2 = s > 0 ? low[2] : -high[2]
+    float l3 = s > 0 ? low[3] : -high[3]
+    var float aLo = na
+    var float aHi = na
+    var float aRef = na
+    var bool aLeft = false
+    var int aHcs = 0
+    int kind = 0
+    float tip = na
+    float lvl = na
+    float edge = na
+    bool fu = l1 < l2 and c1 > l2
+    if not na(aHi)
+        float width = math.max(aHi - aLo, f_px(0.1))
+        float tol = 0.5 * width
+        if not aLeft
+            if l1 > aHi
+                aLeft := true
+            else if c1 < aLo - tol
+                aHi := na
+        else
+            if c1 < aLo or l1 < aLo - tol
+                aHi := na
+            else if l1 <= aHi and c1 >= aHi
+                kind := fu ? 4 : 2
+                tip := l1
+                lvl := fu ? l2 : aRef
+                edge := math.min(o1, c1)
+                aLeft := false
+                if fu
+                    aHcs += 1
+    bool neg = c2 < o2 and l2 < l3 and c1 > o1 and l1 < l2 and c1 > o2
+    if neg and kind < 3
+        kind := 3
+        tip := l1
+        lvl := l2
+        edge := math.min(o1, c1)
+    if fu
+        if kind == 0
+            kind := 1
+            tip := l1
+            lvl := l2
+            edge := math.min(o1, c1)
+        // новая точка отсчёта для ретестов; счёт HCS подряд переносится
+        aLo := l1
+        aHi := math.min(o1, c1)
+        aRef := l2
+        aLeft := false
+        aHcs := kind == 4 ? aHcs : 0
+    int cnt = kind == 4 ? aHcs : 0
+    [kind, na(tip) ? na : s * tip, na(lvl) ? na : s * lvl, na(edge) ? na : s * edge, cnt]
+
+f_ev() =>
+    [kb, tb, lb, eb, cb] = f_ev_side(1)
+    [ks, ts, ls, es, cs] = f_ev_side(-1)
+    [kb, tb, lb, eb, cb, ks, ts, ls, es, cs, time[1]]
+
+// OB для стороны s (1 — BUY: odd-свеча медвежья; -1 — SELL).
+// Возвращает [lo, hi, статус(0 NEW / 1 CONFIRMED / -1 нет), время odd-свечи, край FU (TP3)].
+f_ob(int s) =>
+    float o1 = s * open[1]
+    float c1 = s * close[1]
+    float h1 = s > 0 ? high[1] : -low[1]
+    float l1 = s > 0 ? low[1] : -high[1]
+    float o2 = s * open[2]
+    float c2 = s * close[2]
+    float h2 = s > 0 ? high[2] : -low[2]
+    float l2 = s > 0 ? low[2] : -high[2]
+    float o3 = s * open[3]
+    float c3 = s * close[3]
+    var float lo = na
+    var float hi = na
+    var int st = -1
+    var int tOdd = na
+    var float fuEdge = na
+    var bool left = false
+    float atr = ta.atr(14)[1]
+    float tolZ = f_px(i_zMax)
+    // обновление существующей зоны
+    if not na(lo)
+        if c1 < lo
+            lo := na
+            hi := na
+            st := -1
+        else if not left
+            if l1 > hi
+                left := true
+        else if st == 0
+            float rng1 = h1 - l1
+            bool wick = rng1 > 0 and (math.min(o1, c1) - l1) >= i_bigWick * rng1
+            bool fu1 = l1 < l2 and c1 > l2
+            if l1 <= hi and l1 >= lo - tolZ and c1 >= lo and (wick or fu1)
+                st := 1
+    // новая odd-свеча: [2] — медвежья среди бычьего движения, [1] — бычий FU
+    float bodyHi2 = math.max(o2, c2)
+    float bodyLo2 = math.min(o2, c2)
+    float rng2 = h2 - l2
+    bool odd = c2 < o2 and c3 > o3 and c1 > o1 and c1 > bodyHi2 and rng2 > 0 and ((h2 - bodyHi2) + (bodyLo2 - l2)) <= i_obWick * rng2
+    bool fuNext = l1 < l2 and c1 > l2
+    bool push = (h1 - bodyHi2) >= i_dispAtr * nz(atr)
+    if odd and fuNext and push
+        lo := bodyLo2
+        hi := bodyHi2
+        st := 0
+        tOdd := time[2]
+        fuEdge := h1
+        left := false
+    [na(lo) ? na : s * (s > 0 ? lo : hi), na(hi) ? na : s * (s > 0 ? hi : lo), st, tOdd, na(fuEdge) ? na : s * fuEdge]
+
+f_obs() =>
+    [bl, bh, bs, bt, bf] = f_ob(1)
+    [sl_, sh, ss, st_, sf] = f_ob(-1)
+    [bl, bh, bs, bt, bf, sl_, sh, ss, st_, sf]
+
+// Структура свингов и Negation старшего ТФ: [trend, negDir].
+f_trend() =>
+    float ph = ta.pivothigh(high[1], 2, 2)
+    float pl = ta.pivotlow(low[1], 2, 2)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    if not na(ph)
+        h1 := h2
+        h2 := ph
+    if not na(pl)
+        l1 := l2
+        l2 := pl
+    int trend = 0
+    if not na(h1) and not na(l1)
+        if h2 > h1 and l2 > l1
+            trend := 1
+        else if h2 < h1 and l2 < l1
+            trend := -1
+    var int ageB = 99
+    var int ageS = 99
+    bool negB = close[2] < open[2] and low[2] < low[3] and close[1] > open[1] and low[1] < low[2] and close[1] > open[2]
+    bool negS = close[2] > open[2] and high[2] > high[3] and close[1] < open[1] and high[1] > high[2] and close[1] < open[2]
+    ageB := negB ? 0 : ageB + 1
+    ageS := negS ? 0 : ageS + 1
+    int negDir = 0
+    if ageB < 3 and ageB <= ageS
+        negDir := 1
+    else if ageS < 3
+        negDir := -1
+    [trend, negDir]
+
+// Major-цели (над ценой и под ценой): [u1, k1, u2, k2, d1, k3, d2, k4], коды: 1 Doji, 2 равные хаи/лои, 3 линия, 4 FVG.
+f_targets(bool lv) =>
+    float ref = close[1]
+    float tol = f_px(i_dblTol)
+    float minGap = f_px(i_gap)
+    array<float> upP = array.new_float()
+    array<int> upK = array.new_int()
+    array<float> dnP = array.new_float()
+    array<int> dnK = array.new_int()
+    float runHi = high[1]
+    float runLo = low[1]
+    for i = 2 to 80
+        float body = math.abs(close[i] - open[i])
+        float rng = high[i] - low[i]
+        if lv and (rng == 0 or body <= i_dojiR * rng) and high[i] <= high[i + 1] and low[i] >= low[i + 1]
+            if runHi < high[i] and high[i] > ref
+                array.push(upP, high[i])
+                array.push(upK, 1)
+            if runLo > low[i] and low[i] < ref
+                array.push(dnP, low[i])
+                array.push(dnK, 1)
+        // FVG: медвежий разрыв выше цены (нижний край) и бычий ниже (верхний край)
+        if low[i + 2] - high[i] >= minGap and runHi < high[i] and high[i] > ref
+            array.push(upP, high[i])
+            array.push(upK, 4)
+        if low[i] - high[i + 2] >= minGap and runLo > low[i] and low[i] < ref
+            array.push(dnP, low[i])
+            array.push(dnK, 4)
+        runHi := math.max(runHi, high[i])
+        runLo := math.min(runLo, low[i])
+    if lv
+        // равные хаи/лои: два последних пивота
+        float ph = ta.pivothigh(high[1], 2, 2)
+        float pl = ta.pivotlow(low[1], 2, 2)
+        var float phA = na
+        var float phB = na
+        var int phAi = na
+        var int phBi = na
+        var float plA = na
+        var float plB = na
+        var int plAi = na
+        var int plBi = na
+        var float eqHi = na
+        var float eqLo = na
+        var float phC = na
+        var int phCi = na
+        var float trHi = na
+        if not na(ph)
+            phC := phA
+            phCi := phAi
+            phA := phB
+            phAi := phBi
+            phB := ph
+            phBi := bar_index
+            if not na(phA) and math.abs(phA - phB) <= tol and (phBi - phAi) >= 3
+                eqHi := math.max(phA, phB)
+            // трендовая линия по трём последним пивотам хаёв
+            trHi := na
+            if not na(phC) and not na(phA)
+                float slope = (phB - phC) / (phBi - phCi)
+                float expect = phC + slope * (phAi - phCi)
+                if math.abs(expect - phA) <= tol
+                    trHi := phB + slope * (bar_index + 1 - phBi)
+        if not na(pl)
+            plA := plB
+            plAi := plBi
+            plB := pl
+            plBi := bar_index
+            if not na(plA) and math.abs(plA - plB) <= tol and (plBi - plAi) >= 3
+                eqLo := math.min(plA, plB)
+        if not na(eqHi) and high[1] >= eqHi
+            eqHi := na
+        if not na(eqLo) and low[1] <= eqLo
+            eqLo := na
+        if not na(eqHi) and eqHi > ref
+            array.push(upP, eqHi)
+            array.push(upK, 2)
+        if not na(eqLo) and eqLo < ref
+            array.push(dnP, eqLo)
+            array.push(dnK, 2)
+        if not na(trHi) and trHi > ref
+            array.push(upP, trHi)
+            array.push(upK, 3)
+    // два ближайших выше и ниже, различающиеся не меньше чем на 0.3 пункта
+    float u1 = na
+    float u2 = na
+    int k1 = 0
+    int k2 = 0
+    for [j, v] in upP
+        int kk = array.get(upK, j)
+        if na(u1) or v < u1
+            if not na(u1) and (u1 - v) >= f_px(0.3)
+                u2 := u1
+                k2 := k1
+            u1 := v
+            k1 := kk
+        else if (v - u1) >= f_px(0.3) and (na(u2) or v < u2)
+            u2 := v
+            k2 := kk
+    float d1 = na
+    float d2 = na
+    int k3 = 0
+    int k4 = 0
+    for [j, v] in dnP
+        int kk = array.get(dnK, j)
+        if na(d1) or v > d1
+            if not na(d1) and (v - d1) >= f_px(0.3)
+                d2 := d1
+                k4 := k3
+            d1 := v
+            k3 := kk
+        else if (d1 - v) >= f_px(0.3) and (na(d2) or v > d2)
+            d2 := v
+            k4 := kk
+    [u1, k1, u2, k2, d1, k3, d2, k4]
+
+// ----------------------------------------------------------------- данные с таймфреймов
+[tW, nW] = request.security(syminfo.tickerid, "W", f_trend())
+[tD, nD] = request.security(syminfo.tickerid, "D", f_trend())
+[t4, n4] = request.security(syminfo.tickerid, "240", f_trend())
+
+[bLo1, bHi1, bSt1, bT1, bF1, sLo1, sHi1, sSt1, sT1, sF1] = request.security(syminfo.tickerid, "60", f_obs())
+[bLo4, bHi4, bSt4, bT4, bF4, sLo4, sHi4, sSt4, sT4, sF4] = request.security(syminfo.tickerid, "240", f_obs())
+[bLoD, bHiD, bStD, bTD, bFD, sLoD, sHiD, sStD, sTD, sFD] = request.security(syminfo.tickerid, "D", f_obs())
+[bLoW, bHiW, bStW, bTW, bFW, sLoW, sHiW, sStW, sTW, sFW] = request.security(syminfo.tickerid, "W", f_obs())
+
+[eK5b, eT5b, eL5b, eE5b, eC5b, eK5s, eT5s, eL5s, eE5s, eC5s, eTm5] = f_ev()
+[eK15b, eT15b, eL15b, eE15b, eC15b, eK15s, eT15s, eL15s, eE15s, eC15s, eTm15] = request.security(syminfo.tickerid, "15", f_ev())
+[eK30b, eT30b, eL30b, eE30b, eC30b, eK30s, eT30s, eL30s, eE30s, eC30s, eTm30] = request.security(syminfo.tickerid, "30", f_ev())
+[eK60b, eT60b, eL60b, eE60b, eC60b, eK60s, eT60s, eL60s, eE60s, eC60s, eTm60] = request.security(syminfo.tickerid, "60", f_ev())
+
+[a5u1, a5k1, a5u2, a5k2, a5d1, a5k3, a5d2, a5k4] = f_targets(false)
+[a15u1, a15k1, a15u2, a15k2, a15d1, a15k3, a15d2, a15k4] = request.security(syminfo.tickerid, "15", f_targets(false))
+[a60u1, a60k1, a60u2, a60k2, a60d1, a60k3, a60d2, a60k4] = request.security(syminfo.tickerid, "60", f_targets(true))
+[a4u1, a4k1, a4u2, a4k2, a4d1, a4k3, a4d2, a4k4] = request.security(syminfo.tickerid, "240", f_targets(true))
+[aDu1, aDk1, aDu2, aDk2, aDd1, aDk3, aDd2, aDk4] = request.security(syminfo.tickerid, "D", f_targets(true))
+
+// ----------------------------------------------------------------- журнал манипуляций (BUY / SELL)
+// массивы: подпись, кончик, уровень, край, счёт HCS, ранг ТФ, тип, время
+var array<float> bTip = array.new_float()
+var array<float> bLvl = array.new_float()
+var array<float> bEdge = array.new_float()
+var array<int> bCnt = array.new_int()
+var array<int> bKind = array.new_int()
+var array<int> bTime = array.new_int()
+var array<int> bTfr = array.new_int()
+var array<float> sTip = array.new_float()
+var array<float> sLvl = array.new_float()
+var array<float> sEdge = array.new_float()
+var array<int> sCnt = array.new_int()
+var array<int> sKind = array.new_int()
+var array<int> sTime = array.new_int()
+var array<int> sTfr = array.new_int()
+var int lastEv5 = 0
+var int lastEv15 = 0
+var int lastEv30 = 0
+var int lastEv60 = 0
+
+f_push(array<float> aT, array<float> aL, array<float> aE, array<int> aC, array<int> aK, array<int> aTm, array<int> aR, int kind, float tip, float lvl, float edge, int cnt, int tm, int rank) =>
+    if kind > 0 and not na(tip) and not na(lvl) and not na(edge)
+        array.push(aT, tip)
+        array.push(aL, lvl)
+        array.push(aE, edge)
+        array.push(aC, cnt)
+        array.push(aK, kind)
+        array.push(aTm, tm)
+        array.push(aR, rank)
+        if array.size(aT) > 120
+            array.shift(aT)
+            array.shift(aL)
+            array.shift(aE)
+            array.shift(aC)
+            array.shift(aK)
+            array.shift(aTm)
+            array.shift(aR)
+
+if barstate.isconfirmed
+    if eTm5 != lastEv5
+        lastEv5 := eTm5
+        f_push(bTip, bLvl, bEdge, bCnt, bKind, bTime, bTfr, eK5b, eT5b, eL5b, eE5b, eC5b, eTm5, 1)
+        f_push(sTip, sLvl, sEdge, sCnt, sKind, sTime, sTfr, eK5s, eT5s, eL5s, eE5s, eC5s, eTm5, 1)
+    if eTm15 != lastEv15
+        lastEv15 := eTm15
+        f_push(bTip, bLvl, bEdge, bCnt, bKind, bTime, bTfr, eK15b, eT15b, eL15b, eE15b, eC15b, eTm15, 2)
+        f_push(sTip, sLvl, sEdge, sCnt, sKind, sTime, sTfr, eK15s, eT15s, eL15s, eE15s, eC15s, eTm15, 2)
+    if eTm30 != lastEv30
+        lastEv30 := eTm30
+        f_push(bTip, bLvl, bEdge, bCnt, bKind, bTime, bTfr, eK30b, eT30b, eL30b, eE30b, eC30b, eTm30, 3)
+        f_push(sTip, sLvl, sEdge, sCnt, sKind, sTime, sTfr, eK30s, eT30s, eL30s, eE30s, eC30s, eTm30, 3)
+    if eTm60 != lastEv60
+        lastEv60 := eTm60
+        f_push(bTip, bLvl, bEdge, bCnt, bKind, bTime, bTfr, eK60b, eT60b, eL60b, eE60b, eC60b, eTm60, 4)
+        f_push(sTip, sLvl, sEdge, sCnt, sKind, sTime, sTfr, eK60s, eT60s, eL60s, eE60s, eC60s, eTm60, 4)
+
+// ----------------------------------------------------------------- bias
+f_bias() =>
+    int b = 0
+    if nW != 0
+        b := nW
+    else if nD != 0
+        b := nD
+    else if n4 != 0
+        b := n4
+    else
+        int total = 3 * tW + 2 * tD + 1 * t4
+        b := total >= 2 ? 1 : total <= -2 ? -1 : 0
+    b
+
+// ----------------------------------------------------------------- зона из манипуляций (True Stop)
+// Работает в бычьей ориентации; для SELL значения читаются с обратным знаком.
+// Возвращает [ok, zLo, zHi, trueStop, sl, nDistinct, bestKind, bestCnt, inside] в исходной системе цен.
+f_zone(int s, float obLo, float obHi, int tFrom) =>
+    array<float> tips = s > 0 ? bTip : sTip
+    array<float> lvls = s > 0 ? bLvl : sLvl
+    array<float> edges = s > 0 ? bEdge : sEdge
+    array<int> kinds = s > 0 ? bKind : sKind
+    array<int> cnts = s > 0 ? bCnt : sCnt
+    array<int> times = s > 0 ? bTime : sTime
+    float lo = s > 0 ? obLo : -obHi
+    float hi = s > 0 ? obHi : -obLo
+    float tolO = f_px(i_zTarget)
+    array<int> use = array.new_int()
+    int bestKind = 0
+    int bestCnt = 0
+    bool inside = false
+    int total = array.size(tips)
+    if total > 0
+        for i = 0 to total - 1
+            if array.get(times, i) >= tFrom
+                float t = s * array.get(tips, i)
+                float l = s * array.get(lvls, i)
+                float e = s * array.get(edges, i)
+                float rLo = math.min(t, math.min(l, e))
+                float rHi = math.max(t, math.max(l, e))
+                if rLo <= hi + tolO and rHi >= lo - tolO
+                    array.push(use, i)
+                    int k = array.get(kinds, i)
+                    if k > bestKind
+                        bestKind := k
+                    if k == 4
+                        bestCnt := math.max(bestCnt, array.get(cnts, i))
+                        if rLo <= hi and rHi >= lo
+                            inside := true
+    bool ok = false
+    float zl0 = na
+    float zh0 = na
+    float tStop = na
+    float slc = na
+    int nd = 0
+    int nUse = array.size(use)
+    if nUse > 0
+        for tier = 0 to 1
+            if not ok
+                float width = f_px(tier == 0 ? i_zTarget : i_zMax)
+                float bestC = na
+                int bestN = 0
+                for a = 0 to nUse - 1
+                    float c = s * array.get(lvls, array.get(use, a))
+                    array<float> seen = array.new_float()
+                    for b = 0 to nUse - 1
+                        int ib = array.get(use, b)
+                        float lv = s * array.get(lvls, ib)
+                        if lv >= c - 0.000001 and lv <= c + width + 0.000001
+                            float tp = math.round(s * array.get(tips, ib) * 10) / 10
+                            if not array.includes(seen, tp)
+                                array.push(seen, tp)
+                    int n = array.size(seen)
+                    if n > bestN or (n == bestN and not na(bestC) and c < bestC)
+                        bestN := n
+                        bestC := c
+                if bestN >= 2
+                    float maxTop = bestC
+                    float minTip = bestC
+                    for b = 0 to nUse - 1
+                        int ib = array.get(use, b)
+                        float lv = s * array.get(lvls, ib)
+                        if lv >= bestC - 0.000001 and lv <= bestC + width + 0.000001
+                            maxTop := math.max(maxTop, math.max(lv, s * array.get(edges, ib)))
+                            minTip := math.min(minTip, s * array.get(tips, ib))
+                    float w = math.min(math.max(maxTop - bestC, f_px(i_minW)), width)
+                    if bestC <= hi and bestC + w >= lo
+                        ok := true
+                        zl0 := bestC
+                        zh0 := bestC + w
+                        tStop := bestC
+                        slc := minTip - f_px(i_slBuf)
+                        nd := bestN
+    float rZLo = s > 0 ? zl0 : -zh0
+    float rZHi = s > 0 ? zh0 : -zl0
+    [ok, rZLo, rZHi, s * tStop, s * slc, nd, bestKind, bestCnt, inside]
+
+// ----------------------------------------------------------------- состояние сигнала
+varip bool sigOn = false
+varip int sigSide = 0
+varip string sigId = ""
+varip float zLo = na
+varip float zHi = na
+varip float slV = na
+varip float slInit = na
+varip float tp1 = na
+varip float tp2 = na
+varip float tp3 = na
+varip int tpHit = 0
+varip int sigState = 0       // 1 ждёт зоны, 2 в зоне, 3 вход
+varip int sigExpire = 0
+varip int cStage = 0
+varip int cP1Bar = 0
+varip float cP2Tip = na
+varip float lvl4 = na
+var int lastDay = -1
+var int sentToday = 0
+var string usedIds = ""
+var box zoneBox = na
+var line slLine = na
+var line tp1Line = na
+var line tp2Line = na
+var line tp3Line = na
+
+f_ts() => str.tostring(math.floor(time / 1000))
+f_n(float v) => na(v) ? "null" : str.tostring(v, "#.##")
+f_head(string typ) => '{"secret":"' + i_secret + '","type":"' + typ + '","id":"' + sigId + '"'
+
+f_event(string name, float price, string extra) =>
+    string msg = f_head("event") + ',"event":"' + name + '","time":' + f_ts() + ',"price":' + f_n(price) + extra + '}'
+    if not i_live or barstate.isrealtime
+        alert(msg, alert.freq_all)
+
+f_close_sig() =>
+    sigOn := false
+    sigState := 0
+    tpHit := 0
+
+f_kind_label(int k) => k == 1 ? "Doji" : k == 2 ? "равные уровни" : k == 3 ? "трендовая линия" : "имбаланс FVG"
+
+// ----------------------------------------------------------------- ежебарная логика (закрытая M5 свеча)
+int dayNow = dayofmonth(time, "Asia/Bishkek")
+if dayNow != lastDay
+    lastDay := dayNow
+    sentToday := 0
+
+float pt = i_pt
+bool live = not i_live or barstate.isrealtime
+
+// сопровождение: касания уровней внутри бара (varip — состояние не откатывается на тиках)
+if sigOn and live
+    int sgn = sigSide
+    bool slHit = sgn > 0 ? low <= slV : high >= slV
+    bool tp1Hit = sgn > 0 ? high >= tp1 : low <= tp1
+    if sigState < 3
+        // до входа
+        if time_close > sigExpire * 1000
+            f_event("CANCEL", close, ',"reason":"истёк срок"')
+            f_close_sig()
+        else if slHit
+            f_event("CANCEL", slV, ',"reason":"цена пробила уровень стопа до входа"')
+            f_close_sig()
+        else if tp1Hit
+            f_event("CANCEL", tp1, ',"reason":"цена ушла к цели без входа"')
+            f_close_sig()
+    else
+        if slHit
+            f_event("SL", slV, "")
+            f_close_sig()
+        else
+            if tpHit < 1 and tp1Hit
+                tpHit := 1
+                f_event("TP1", tp1, "")
+            if tpHit == 1 and not na(tp2) and (sgn > 0 ? high >= tp2 : low <= tp2)
+                tpHit := 2
+                f_event("TP2", tp2, "")
+            if tpHit == 2 and not na(tp3) and (sgn > 0 ? high >= tp3 : low <= tp3)
+                tpHit := 3
+                f_event("TP3", tp3, "")
+            bool done = (tpHit == 1 and na(tp2)) or (tpHit == 2 and na(tp3)) or tpHit == 3
+            if done
+                f_close_sig()
+
+// цикл манипуляции и отмены по закрытию бара
+if barstate.isconfirmed and sigOn and live and sigState < 3
+    int sgn = sigSide
+    float lowS = sgn > 0 ? low : -high
+    float closeS = sgn * close
+    float zlS = sgn > 0 ? zLo : -zHi
+    float zhS = sgn > 0 ? zHi : -zLo
+    // закрытие H1 за зоной снимает зону
+    if (time_close % 3600000) == 0 and (sgn > 0 ? close < zLo : close > zHi)
+        f_event("CANCEL", close, ',"reason":"зона снята: закрытие H1 за зоной"')
+        f_close_sig()
+    else
+        if cStage == 0 and lowS <= zhS
+            cStage := 1
+            cP1Bar := bar_index
+            sigState := 2
+            f_event("ZONE", close, "")
+        if cStage >= 1 and lowS < zlS
+            float tipS = sgn > 0 ? low : high
+            if cStage == 1
+                cStage := 2
+                cP2Tip := tipS
+            else
+                cP2Tip := sgn > 0 ? math.min(cP2Tip, tipS) : math.max(cP2Tip, tipS)
+        if cStage == 2 and closeS > zlS and bar_index > cP1Bar
+            bool inZone = closeS <= zhS
+            if not inZone
+                f_event("CANCEL", close, ',"reason":"вход упущен: закрытие точки 3 вне зоны"')
+                f_close_sig()
+            else
+                float newSl = sgn > 0 ? math.min(slV, cP2Tip - f_px(i_slBuf)) : math.max(slV, cP2Tip + f_px(i_slBuf))
+                float mid = (zLo + zHi) / 2
+                float risk = math.abs(mid - newSl)
+                bool bad = risk > f_px(i_slMax) or (i_minRR > 0 and math.abs(tp1 - mid) / risk < i_minRR)
+                if bad
+                    f_event("CANCEL", close, ',"reason":"после выноса стоп дальше SL_MAX или RR ниже минимума"')
+                    f_close_sig()
+                else
+                    slV := newSl
+                    sigState := 3
+                    cStage := 3
+                    f_event("ENTRY", close, ',"p2_tip":' + f_n(cP2Tip))
+
+// ----------------------------------------------------------------- поиск нового сигнала
+if barstate.isconfirmed and not sigOn and live and sentToday < i_maxDay
+    int bias = f_bias()
+    // кандидаты: сторона, ТФ OB
+    for side = 0 to 1
+        int s = side == 0 ? 1 : -1
+        if not sigOn and bias == s
+            for tfI = 0 to 3
+                float oLo = na
+                float oHi = na
+                int oSt = -1
+                int oT = 0
+                float oFu = na
+                string oTf = ""
+                if tfI == 0
+                    oLo := s > 0 ? bLo1 : sLo1
+                    oHi := s > 0 ? bHi1 : sHi1
+                    oSt := s > 0 ? bSt1 : sSt1
+                    oT := s > 0 ? bT1 : sT1
+                    oFu := s > 0 ? bF1 : sF1
+                    oTf := "H1"
+                else if tfI == 1
+                    oLo := s > 0 ? bLo4 : sLo4
+                    oHi := s > 0 ? bHi4 : sHi4
+                    oSt := s > 0 ? bSt4 : sSt4
+                    oT := s > 0 ? bT4 : sT4
+                    oFu := s > 0 ? bF4 : sF4
+                    oTf := "H4"
+                else if tfI == 2
+                    oLo := s > 0 ? bLoD : sLoD
+                    oHi := s > 0 ? bHiD : sHiD
+                    oSt := s > 0 ? bStD : sStD
+                    oT := s > 0 ? bTD : sTD
+                    oFu := s > 0 ? bFD : sFD
+                    oTf := "D1"
+                else
+                    oLo := s > 0 ? bLoW : sLoW
+                    oHi := s > 0 ? bHiW : sHiW
+                    oSt := s > 0 ? bStW : sStW
+                    oT := s > 0 ? bTW : sTW
+                    oFu := s > 0 ? bFW : sFW
+                    oTf := "W"
+                string id = "MC:" + (s > 0 ? "BUY" : "SELL") + ":" + oTf + ":" + str.tostring(oT)
+                bool near = not na(oLo) and (s > 0 ? close >= oLo - f_px(i_zMax) : close <= oHi + f_px(i_zMax)) and math.abs(close - (s > 0 ? oHi : oLo)) <= f_px(i_maxDist) + (oHi - oLo)
+                if not sigOn and oSt == 1 and near and not str.contains(usedIds, id)
+                    [ok, zl, zh, tstop, slc, nd, bestKind, bestCnt, inside] = f_zone(s, oLo, oHi, oT)
+                    if ok
+                        float mid = (zl + zh) / 2
+                        float risk = math.abs(mid - slc)
+                        // цели в сторону сделки дальше зоны
+                        array<float> cand = array.new_float()
+                        array<int> candK = array.new_int()
+                        float beyond = s > 0 ? zh : zl
+                        array<float> srcP = array.from(a5u1, a5u2, a15u1, a15u2, a60u1, a60u2, a4u1, a4u2, a5d1, a5d2, a15d1, a15d2, a60d1, a60d2, a4d1, a4d2)
+                        array<int> srcK = array.from(a5k1, a5k2, a15k1, a15k2, a60k1, a60k2, a4k1, a4k2, a5k3, a5k4, a15k3, a15k4, a60k3, a60k4, a4k3, a4k4)
+                        for [q, v] in srcP
+                            bool isUp = q < 8
+                            if not na(v) and ((s > 0 and isUp and v > beyond) or (s < 0 and not isUp and v < beyond))
+                                array.push(cand, s * v)
+                                array.push(candK, array.get(srcK, q))
+                        float t1 = na
+                        float t2 = na
+                        int k1 = 0
+                        for [q, v] in cand
+                            if na(t1) or v < t1
+                                if not na(t1) and (t1 - v) >= f_px(1.0)
+                                    t2 := t1
+                                t1 := v
+                                k1 := array.get(candK, q)
+                            else if (v - t1) >= f_px(1.0) and (na(t2) or v < t2)
+                                t2 := v
+                        float t3 = na
+                        float fuE = s * oFu
+                        if not na(t2)
+                            if not na(oFu) and (fuE - t2) >= f_px(1.0)
+                                t3 := fuE
+                            else
+                                array<float> htf = s > 0 ? array.from(a4u1, a4u2, aDu1, aDu2) : array.from(a4d1, a4d2, aDd1, aDd2)
+                                for [hq, hv] in htf
+                                    float hm = s * hv
+                                    if not na(hm) and (hm - t2) >= f_px(1.0) and (na(t3) or hm < t3)
+                                        t3 := hm
+                        float tp1v = s * t1
+                        float tp2v = na(t2) ? na : s * t2
+                        float tp3v = na(t3) ? na : s * t3
+                        float width = math.abs(zh - zl) / pt
+                        bool rrOk = i_minRR <= 0 or (not na(tp1v) and risk > 0 and math.abs(tp1v - mid) / risk >= i_minRR)
+                        bool riskOk = risk > 0 and risk <= f_px(i_slMax)
+                        bool alive = (s > 0 ? close > slc : close < slc) and (s > 0 ? close < tp1v : close > tp1v)
+                        bool biasOk = bias == s
+                        string strength = "C"
+                        string sign = "только FU/AFU"
+                        if biasOk and bestKind == 4 and bestCnt >= 2 and inside
+                            strength := "A+"
+                            sign := "HCS x" + str.tostring(math.min(bestCnt, 3)) + " внутри HTF OB"
+                        else if biasOk and bestKind == 4
+                            strength := "A"
+                            sign := inside ? "HCS внутри OB" : "HCS в зоне"
+                        else if biasOk and bestKind == 3
+                            strength := "A"
+                            sign := "FU Negation"
+                        else if biasOk and bestKind == 2
+                            strength := "B"
+                            sign := "FU re-test"
+                        if not na(tp1v) and rrOk and riskOk and alive and width <= i_zMax and strength != "C"
+                            // готов сигнал
+                            sigOn := true
+                            sigSide := s
+                            sigId := id
+                            zLo := zl
+                            zHi := zh
+                            slV := slc
+                            slInit := slc
+                            tp1 := tp1v
+                            tp2 := tp2v
+                            tp3 := tp3v
+                            tpHit := 0
+                            sigState := 1
+                            cStage := 0
+                            cP2Tip := na
+                            usedIds += id + ";"
+                            sentToday += 1
+                            int expDays = hour(time_close, "Asia/Bishkek") >= i_ttlEnd ? 1 : 0
+                            sigExpire := math.floor(timestamp("Asia/Bishkek", year(time_close, "Asia/Bishkek"), month(time_close, "Asia/Bishkek"), dayofmonth(time_close, "Asia/Bishkek") + expDays, i_ttlEnd, 0) / 1000)
+                            string dirWord = s > 0 ? "бычий" : "медвежий"
+                            string conf = '[[true,"Bias W/D1/H4: ' + dirWord + ' поток"],[true,"OB ' + oTf + ' (' + (s > 0 ? "Sell to Buy" : "Buy to Sell") + '), зона CONFIRMED"],[true,"' + sign + '"],[true,"Цель: LAL — ' + f_kind_label(k1) + '"],[false,"Вход M5: жди точку 3 (закрытие ' + (s > 0 ? "выше Prev. LOW " : "ниже Prev. HIGH ") + str.tostring(tstop, "#.#") + ')"]]'
+                            string tpsJ = '[' + f_n(tp1v) + (na(tp2v) ? '' : ',' + f_n(tp2v)) + (na(tp3v) ? '' : ',' + f_n(tp3v)) + ']'
+                            string msg = '{"secret":"' + i_secret + '","type":"signal","id":"' + id + '","side":"' + (s > 0 ? "BUY" : "SELL") + '","strength":"' + strength + '","time":' + f_ts() + ',"zone_lo":' + f_n(zl) + ',"zone_hi":' + f_n(zh) + ',"true_stop":' + f_n(tstop) + ',"sl":' + f_n(slc) + ',"tps":' + tpsJ + ',"confirmations":' + conf + ',"tfs":["D1","H4","' + oTf + '","M15","M5"],"feed":"' + i_feed + '","expires":' + str.tostring(sigExpire) + ',"ob_tf":"' + oTf + '","ob_label":"' + (s > 0 ? "Sell to Buy" : "Buy to Sell") + '","sign":"' + sign + '"}'
+                            alert(msg, alert.freq_all)
+
+// ----------------------------------------------------------------- рисование
+if i_draw and barstate.islast
+    box.delete(zoneBox)
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(tp3Line)
+    if sigOn
+        color zc = sigSide > 0 ? color.new(color.green, 70) : color.new(color.red, 70)
+        zoneBox := box.new(bar_index - 40, zHi, bar_index + 20, zLo, border_color=color.gray, bgcolor=zc)
+        slLine := line.new(bar_index - 40, slV, bar_index + 20, slV, color=color.red, style=line.style_dashed)
+        tp1Line := line.new(bar_index - 40, tp1, bar_index + 20, tp1, color=color.green, style=line.style_dashed)
+        if not na(tp2)
+            tp2Line := line.new(bar_index - 40, tp2, bar_index + 20, tp2, color=color.green, style=line.style_dashed)
+        if not na(tp3)
+            tp3Line := line.new(bar_index - 40, tp3, bar_index + 20, tp3, color=color.green, style=line.style_dashed)
+
+plotchar(sigOn ? 1 : na, "Активный сигнал", "●", location.top, color=sigSide > 0 ? color.green : color.red, size=size.tiny)

@@ -1,0 +1,11 @@
+services:
+  xau-engine:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/xau_engine.sqlite3
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
