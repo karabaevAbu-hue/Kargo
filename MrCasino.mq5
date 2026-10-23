@@ -149,6 +149,7 @@ struct SZone
    double            lvl[6];       // реальные цены снятой ликвидности
    string            lastSkip;
    datetime          lastSkipT;
+   int               updId;        // номер пересчёта, в котором зона обновлена
   };
 
 struct SSig
@@ -198,6 +199,7 @@ string     g_lastSkip   = "-";
 string     g_lk[];
 int        g_cntDayKey  = -1;
 int        g_cntToday   = 0;
+int        g_rebuildId  = 0;
 
 // открытая позиция робота
 long       g_pId        = 0;
@@ -808,36 +810,60 @@ void ZoneNotify(SZone &z)
                        DirName(z.dir), Px(z.lo), Px(z.hi), z.hi - z.lo, z.score, z.srcs));
   }
 
-// Сужение до 3..10 пунктов: пересечение теней FU (True Stop) на M15, затем M5 [§6.2]
-void NarrowTS(int d, datetime born, double &lo, double &hi)
+// Участок региона, где перекрывается больше всего теней FU (первый снизу при равенстве)
+bool MaxOverlap(int d, ENUM_TIMEFRAMES tf, datetime since, double rl, double rh, double &ol, double &oh)
   {
-   ENUM_TIMEFRAMES tfs[2] = {PERIOD_M15, PERIOD_M5};
-   for(int t = 0; t < 2 && hi - lo > InpZoneMax; t++)
+   MqlRates m[];
+   int sh = iBarShift(g_sym, tf, since);
+   int n = Load(tf, MathMin(MathMax(sh + 2, 5), 700), m);
+   double A[], B[];
+   int k = 0;
+   for(int j = 1; j < n - 1; j++)
      {
-      MqlRates m[];
-      int sh = iBarShift(g_sym, tfs[t], born);
-      int n = Load(tfs[t], MathMin(MathMax(sh + 2, 5), 700), m);
-      bool f = false;
-      double cl = 0, ch = 0;
-      for(int j = 1; j < n - 1; j++)
+      if(m[j].time < since) break;
+      if(FUClass(m, j, d) < 1) continue;
+      double a = MathMax(Lv(m, j, d), rl), b = MathMin(BBot(m, j, d), rh);
+      if(b - a < 0.01) continue;
+      ArrayResize(A, k + 1);
+      ArrayResize(B, k + 1);
+      A[k] = a; B[k] = b; k++;
+     }
+   if(k == 0) return false;
+   double P[];
+   ArrayResize(P, 2 * k);
+   for(int i = 0; i < k; i++) { P[2 * i] = A[i]; P[2 * i + 1] = B[i]; }
+   ArraySort(P);
+   int best = 0;
+   double bl = 0, bh = 0;
+   for(int i = 0; i < 2 * k - 1; i++)
+     {
+      double x1 = P[i], x2 = P[i + 1];
+      if(x2 - x1 < 1e-9) continue;
+      int cov = 0;
+      for(int q = 0; q < k; q++)
+         if(A[q] <= x1 + 1e-9 && B[q] >= x2 - 1e-9) cov++;
+      if(cov > best) { best = cov; bl = x1; bh = x2; }
+      else if(cov == best && cov > 0 && MathAbs(x1 - bh) < 1e-9) bh = x2;
+     }
+   if(best == 0) return false;
+   ol = bl; oh = bh;
+   return true;
+  }
+
+// Сужение до 3..10 внутри самого сильного источника группы [§6.2, True Stop]
+void NarrowGroup(int d, double alo, double ahi, datetime aT0, double &lo, double &hi)
+  {
+   if(hi - lo > InpZoneMax)
+     {
+      double rl = MathMax(lo, alo), rh = MathMin(hi, ahi);
+      if(rh - rl < 0.01) { rl = lo; rh = hi; }
+      ENUM_TIMEFRAMES tfs[2] = {PERIOD_M15, PERIOD_M5};
+      for(int t = 0; t < 2 && rh - rl > InpZoneMax; t++)
         {
-         if(m[j].time < born) break;
-         if(FUClass(m, j, d) < 1) continue;
-         double a = Lv(m, j, d), b = BBot(m, j, d);
-         if(a < lo - 2.0 || a > hi) continue;
-         if(!f) { cl = a; ch = b; f = true; }
-         else
-           {
-            double il = MathMax(a, cl), ih = MathMin(b, ch);
-            if(il <= ih) { cl = il; ch = ih; }
-           }
+         double ol, oh;
+         if(MaxOverlap(d, tfs[t], aT0, rl, rh, ol, oh)) { rl = ol; rh = oh; }
         }
-      if(f)
-        {
-         double il = MathMax(cl, lo), ih = MathMin(ch, hi);
-         if(il <= ih) { lo = il; hi = ih; }
-         else { lo = cl; hi = ch; }
-        }
+      lo = rl; hi = rh;
      }
    if(hi - lo > InpZoneMax) hi = lo + InpZoneMax;
    if(hi - lo < InpZoneMin) hi = lo + InpZoneMin;
@@ -853,6 +879,13 @@ void AddCand(SCand &c[], int src, ENUM_TIMEFRAMES tf, double lo, double hi, date
    ArrayResize(c, k + 1);
    c[k].src = src; c[k].tf = tf; c[k].lo = lo; c[k].hi = hi; c[k].t0 = t0;
    c[k].pts = pts; c[k].fuAfter = fuAfter; c[k].lvl = lvl; c[k].label = label;
+  }
+
+// Грубый отбор кандидатов (3 радиуса); точный радиус проверяется по готовой зоне
+bool NearWide(int d, double lo, double hi)
+  {
+   double pm = d * SymbolInfoDouble(g_sym, SYMBOL_BID);
+   return lo <= pm && (pm - hi) <= 3.0 * InpZoneRadius;
   }
 
 // Источник 1: Order Block (odd-свеча против движения, зона = тело)
@@ -888,7 +921,7 @@ void GenOB(ENUM_TIMEFRAMES tf, int d, SCand &c[])
          if(IsFU(r, j, d) && Lv(r, j, d) <= top) { fu = true; break; }
       if(InpOBNeedFU && !fu)
         { cNoFU++; if(LogOnce(tag + "f")) Lg(2, "Отброшен " + tag + ": нет FU"); continue; }
-      if(!NearPrice(d, bot, top))
+      if(!NearWide(d, bot, top))
         { cFar++; if(LogOnce(tag + "r")) Lg(2, "Отброшен " + tag + ": дальше радиуса"); continue; }
       AddCand(c, 1, tf, bot, top, t0, pts, fu, 0, TFName(tf) + " OB");
       cOk++;
@@ -910,7 +943,7 @@ void GenFU(ENUM_TIMEFRAMES tf, int d, SCand &c[])
       if(FUClass(r, i, d) < 1) continue;
       double a = Lv(r, i, d), b = BBot(r, i, d);
       if(b - a < InpFUZoneMinWick) continue;
-      if(!NearPrice(d, a, b)) continue;
+      if(!NearWide(d, a, b)) continue;
       AddCand(c, 2, tf, a, b, t0, pts, false, 0, TFName(tf) + " FU");
      }
   }
@@ -949,42 +982,38 @@ void GenLiq(ENUM_TIMEFRAMES tf, int d, SCand &c[])
            }
         }
       double lo = L - InpSweepZone, hi = L + 1.0;
-      if(!NearPrice(d, lo, hi)) continue;
+      if(!NearWide(d, lo, hi)) continue;
       AddCand(c, 3, tf, lo, hi, t0, pts, false, L, StringFormat("%s %s %s", TFName(tf), nm, Px(d * L)));
-     }
-  }
-
-void SortCands(SCand &c[])
-  {
-   int n = ArraySize(c);
-   for(int a = 1; a < n; a++)
-     {
-      SCand key = c[a];
-      int b = a - 1;
-      while(b >= 0 && c[b].lo > key.lo)
-        {
-         c[b + 1] = c[b];
-         b--;
-        }
-      c[b + 1] = key;
      }
   }
 
 //+------------------------------------------------------------------+
 //| Слияние, баллы, учёт зон [§6.2]                                  |
 //+------------------------------------------------------------------+
-void UpsertGroup(int d, SCand &c[], int a, int b, double glo, double ghi)
+int CandStrength(const SCand &c)
   {
+   if(c.src == 1 || c.src == 3) return 10 + c.pts;   // OB H4/H1, EQH/EQL сильнее теней FU
+   return c.pts;
+  }
+
+void UpsertGroup(int d, SCand &c[], int &mem[], int ai, double glo, double ghi)
+  {
+   double nlo = glo, nhi = ghi;
+   NarrowGroup(d, c[ai].lo, c[ai].hi, c[ai].t0, nlo, nhi);
+
+   // в баллы и подпись идут только источники, попавшие в суженную зону
    int obP = 0, fuP = 0, nFU = 0, liqP = 0;
    bool fuAfter = false;
-   datetime born = c[a].t0, newest = c[a].t0;
+   datetime formed = 0;
    ENUM_TIMEFRAMES topTF = PERIOD_M15;
    int topRank = 0;
    string sOb = "", sFu = "", sLq = "";
    double lv[6];
    int nl = 0;
-   for(int k = a; k <= b; k++)
+   for(int q = 0; q < ArraySize(mem); q++)
      {
+      int k = mem[q];
+      if(k != ai && (c[k].hi < nlo || c[k].lo > nhi)) continue;
       if(c[k].src == 1)
         {
          obP = MathMax(obP, c[k].pts);
@@ -1001,10 +1030,9 @@ void UpsertGroup(int d, SCand &c[], int a, int b, double glo, double ghi)
         {
          liqP = MathMax(liqP, c[k].pts);
          if(StringFind(sLq, c[k].label) < 0) sLq += (sLq == "" ? "" : " + ") + c[k].label;
-         if(nl < 6) { lv[nl] = d * c[k].lvl; nl++; }
+         if(nl < 6 && c[k].lvl >= nlo - 2.0 && c[k].lvl <= nhi + 2.0) { lv[nl] = d * c[k].lvl; nl++; }
         }
-      born = MathMin(born, c[k].t0);
-      newest = MathMax(newest, c[k].t0);
+      formed = MathMax(formed, c[k].t0);          // зона образовалась с последним попавшим в неё источником
       int rk = c[k].tf == PERIOD_H4 ? 3 : (c[k].tf == PERIOD_H1 ? 2 : 1);
       if(rk > topRank) { topRank = rk; topTF = c[k].tf; }
      }
@@ -1014,29 +1042,31 @@ void UpsertGroup(int d, SCand &c[], int a, int b, double glo, double ghi)
    int srcScore = obP + fuP + MathMin(3, MathMax(0, nFU - 1)) + liqP + (fuAfter ? 1 : 0);
 
    double rulo = d > 0 ? glo : -ghi, ruhi = d > 0 ? ghi : -glo;
+   double zlo = NormalizeDouble(d > 0 ? nlo : -nhi, g_digits);
+   double zhi = NormalizeDouble(d > 0 ? nhi : -nlo, g_digits);
 
-   // поиск существующей зоны по объединению источников
+   // поиск существующей зоны по объединению источников; одна зона обновляется один раз за пересчёт
    int act = -1;
    bool deadCover = false;
    for(int i = 0; i < ArraySize(g_zones); i++)
      {
-      if(g_zones[i].dir != d) continue;
+      if(g_zones[i].dir != d || g_zones[i].updId == g_rebuildId) continue;
       if(g_zones[i].uhi < rulo - 1.0 || g_zones[i].ulo > ruhi + 1.0) continue;
       if(g_zones[i].status <= ZONE_CONFIRMED) { act = i; break; }
-      if(g_zones[i].newest >= newest) deadCover = true;
+      if(g_zones[i].newest >= formed) deadCover = true;
      }
    if(act < 0 && deadCover)
      {
-      string tag = StringFormat("%s %s–%s", DirName(d), Px(rulo), Px(ruhi));
-      if(LogOnce("dup" + tag + TimeToString(newest))) Lg(2, "Кандидат " + tag + " | " + srcs + ": уже построена");
+      string tag = StringFormat("%s %s–%s", DirName(d), Px(zlo), Px(zhi));
+      if(LogOnce("dup" + tag + TimeToString(formed))) Lg(2, "Кандидат " + tag + " | " + srcs + ": уже построена");
       return;
      }
-
-   double nlo = glo, nhi = ghi;
-   NarrowTS(d, born, nlo, nhi);
-   double zlo = d > 0 ? nlo : -nhi, zhi = d > 0 ? nhi : -nlo;
-   zlo = NormalizeDouble(zlo, g_digits);
-   zhi = NormalizeDouble(zhi, g_digits);
+   if(act < 0 && !NearPrice(d, d > 0 ? zlo : -zhi, d > 0 ? zhi : -zlo))
+     {
+      string tag = StringFormat("%s %s–%s", DirName(d), Px(zlo), Px(zhi));
+      if(LogOnce("far" + tag + TimeToString(formed))) Lg(2, "Кандидат " + tag + " | " + srcs + ": дальше радиуса");
+      return;
+     }
 
    bool isNew = (act < 0);
    int idx = act;
@@ -1053,18 +1083,22 @@ void UpsertGroup(int d, SCand &c[], int a, int b, double glo, double ghi)
       g_zones[idx].tradable = false;
       g_zones[idx].lo = zlo;
       g_zones[idx].hi = zhi;
+      g_zones[idx].born = formed;
+      g_zones[idx].newest = formed;
      }
    bool rangeChanged = isNew || (g_zones[idx].status == ZONE_NEW &&
                                  (MathAbs(g_zones[idx].lo - zlo) > 0.005 || MathAbs(g_zones[idx].hi - zhi) > 0.005));
-   if(!isNew && g_zones[idx].status == ZONE_NEW && rangeChanged)
+   if(!isNew && rangeChanged)
      {
       g_zones[idx].lo = zlo;
       g_zones[idx].hi = zhi;
+      g_zones[idx].born = formed;
+      g_zones[idx].newest = formed;
      }
+   g_zones[idx].updId = g_rebuildId;
    g_zones[idx].ulo = rulo;
    g_zones[idx].uhi = ruhi;
-   g_zones[idx].born = isNew ? born : MathMin(g_zones[idx].born, born);
-   g_zones[idx].newest = isNew ? newest : MathMax(g_zones[idx].newest, newest);
+   g_zones[idx].newest = MathMax(g_zones[idx].newest, formed);
    g_zones[idx].topTF = topTF;
    g_zones[idx].srcs = srcs;
    g_zones[idx].srcScore = srcScore;
@@ -1118,6 +1152,7 @@ void PruneZones()
 // Пересчёт зон на каждой новой свече M15 [§6.3]
 void RebuildZones()
   {
+   g_rebuildId++;
    for(int s = 0; s < 2; s++)
      {
       int d = s == 0 ? 1 : -1;
@@ -1132,20 +1167,46 @@ void RebuildZones()
       GenFU(PERIOD_M15, d, c);
       GenLiq(PERIOD_H1, d, c);
       GenLiq(PERIOD_M15, d, c);
-      SortCands(c);
       int n = ArraySize(c);
-      int i = 0;
-      while(i < n)
+      bool used[];
+      ArrayResize(used, n);
+      for(int k = 0; k < n; k++) used[k] = false;
+      while(true)
         {
-         double glo = c[i].lo, ghi = c[i].hi;
-         int j = i + 1;
-         while(j < n && c[j].lo <= ghi + 1.0)
+         // якорь кластера: самый сильный кандидат, при равенстве самый свежий
+         int ai = -1, bst = -1;
+         for(int k = 0; k < n; k++)
            {
-            ghi = MathMax(ghi, c[j].hi);
-            j++;
+            if(used[k]) continue;
+            int st = CandStrength(c[k]);
+            if(st > bst || (st == bst && ai >= 0 && c[k].t0 > c[ai].t0)) { bst = st; ai = k; }
            }
-         UpsertGroup(d, c, i, j - 1, glo, ghi);
-         i = j;
+         if(ai < 0) break;
+         double glo = c[ai].lo, ghi = c[ai].hi;
+         double limit = MathMax(2.0 * InpZoneMax, ghi - glo);   // группа не шире 2×InpZoneMax
+         int mem[];
+         ArrayResize(mem, 1);
+         mem[0] = ai;
+         used[ai] = true;
+         bool added = true;
+         while(added)
+           {
+            added = false;
+            for(int k = 0; k < n; k++)
+              {
+               if(used[k]) continue;
+               if(c[k].lo > ghi + 1.0 || c[k].hi < glo - 1.0) continue;
+               double nl2 = MathMin(glo, c[k].lo), nh2 = MathMax(ghi, c[k].hi);
+               if(nh2 - nl2 > limit) continue;
+               glo = nl2; ghi = nh2;
+               used[k] = true;
+               int m = ArraySize(mem);
+               ArrayResize(mem, m + 1);
+               mem[m] = k;
+               added = true;
+              }
+           }
+         UpsertGroup(d, c, mem, ai, glo, ghi);
         }
      }
    PruneZones();
