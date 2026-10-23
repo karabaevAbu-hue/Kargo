@@ -10,7 +10,7 @@
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "2.00"
+#property version   "2.10"
 #property description "Mr. Casino Flashcards v2: OB/FU/ликвидность -> ближние зоны -> триггеры A-D"
 
 #include <Trade\Trade.mqh>
@@ -61,6 +61,8 @@ input double          InpWickPct        = 40.0;         // Тень у FU / си
 input double          InpLqMin          = 0.3;          // Прокол экстремума, пунктов
 input ENUM_MIN_FU     InpMinFUClass     = FU_CLASS_B;   // Мин. класс FU для триггера A
 input double          InpHCSTol         = 1.0;          // Допуск HCS, пунктов
+input double          InpPierceMax      = 6.0;          // Допуск прокола за край зоны, пунктов
+input int             InpTrigLookback   = 3;            // Свечей M5 на поиск прокола (A, D)
 
 input group "Триггеры [§7]"
 input bool            InpUseTrigA       = true;         // A: Manipulation Cycle
@@ -196,6 +198,8 @@ SDay       g_day;
 bool       g_isTester   = false;
 int        g_markIdx    = 0;
 string     g_lastSkip   = "-";
+double     g_liq[];                // неснятые уровни ликвидности, реальные цены
+int        g_liqDir[];
 string     g_lk[];
 int        g_cntDayKey  = -1;
 int        g_cntToday   = 0;
@@ -948,6 +952,17 @@ void GenFU(ENUM_TIMEFRAMES tf, int d, SCand &c[])
      }
   }
 
+void AddLiq(int d, double price)
+  {
+   for(int k = 0; k < ArraySize(g_liq); k++)
+      if(g_liqDir[k] == d && MathAbs(g_liq[k] - price) < 0.05) return;
+   int n = ArraySize(g_liq);
+   ArrayResize(g_liq, n + 1);
+   ArrayResize(g_liqDir, n + 1);
+   g_liq[n] = price;
+   g_liqDir[n] = d;
+  }
+
 // Источник 3: ещё не снятая ликвидность (равные уровни, swing, Doji) -> зона за уровнем
 void GenLiq(ENUM_TIMEFRAMES tf, int d, SCand &c[])
   {
@@ -965,11 +980,12 @@ void GenLiq(ENUM_TIMEFRAMES tf, int d, SCand &c[])
       for(int k = 1; k < i; k++)
          if(Lv(r, k, d) < L) { swept = true; break; }
       if(swept) continue;
+      AddLiq(d, d * L);
       int pts = 2;
       string nm = d > 0 ? (sw ? "SWL" : "DOJI") : (sw ? "SWH" : "DOJI");
       if(sw)
         {
-         datetime lim = TimeCurrent() - (long)InpZoneLifeHours * 3600;
+         datetime lim = (datetime)((long)TimeCurrent() - (long)InpZoneLifeHours * 3600);
          for(int j = i + 1; j < n - 2; j++)
            {
             if(r[j].time < lim) break;
@@ -1153,6 +1169,8 @@ void PruneZones()
 void RebuildZones()
   {
    g_rebuildId++;
+   ArrayResize(g_liq, 0);
+   ArrayResize(g_liqDir, 0);
    for(int s = 0; s < 2; s++)
      {
       int d = s == 0 ? 1 : -1;
@@ -1259,6 +1277,12 @@ void FillSig(SSig &s, string trig, int cls, bool strong, double ext, string mark
    s.pts = TrigPts(trig, strong) + (cls == 3 ? 2 : (cls == 2 ? 1 : 0));
   }
 
+void AddWhy(string &why, string m)
+  {
+   if(StringFind(why, m) >= 0) return;
+   why += (why == "" ? "" : "; ") + m;
+  }
+
 // A: Manipulation Cycle (точки 1 и 2 ждём, вход на 3)
 bool TriggerA(const SZone &z, const MqlRates &r[], SSig &s, string &why)
   {
@@ -1268,17 +1292,27 @@ bool TriggerA(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    for(int x = 3; x <= 30 && x + 1 < n; x++)
      {
       double L = Lv(r, x, d);
-      if(L < Lv(r, x - 1, d) && L < Lv(r, x + 1, d) && L >= zl && L <= zh) { k = x; break; }
+      if(L < Lv(r, x - 1, d) && L < Lv(r, x + 1, d) && L >= zl - InpPierceMax && L <= zh) { k = x; break; }
      }
-   if(k < 0) return false;
+   if(k < 0) { AddWhy(why, "A: нет точки 1 в зоне"); return false; }
    double prevLow = Lv(r, k, d);
    double pierce = DBL_MAX;
-   for(int q = 1; q < k; q++) pierce = MathMin(pierce, Lv(r, q, d));
-   if(!(pierce < prevLow) || pierce < zl - 2.0 || !(Cv(r, 1, d) > prevLow)) return false;
-   int cls = FUClass(r, 1, d);
+   int jp = -1;
+   for(int q = 1; q < k; q++)
+      if(Lv(r, q, d) < pierce) { pierce = Lv(r, q, d); jp = q; }
+   if(jp < 0 || !(pierce < prevLow)) { AddWhy(why, "A: точка 1 " + Px(d * prevLow) + " не проколота"); return false; }
+   if(pierce < zl - InpPierceMax)
+     {
+      AddWhy(why, StringFormat("A: прокол %s дальше допуска %s", Px(d * pierce), Px(d * (zl - InpPierceMax))));
+      return false;
+     }
+   if(jp > InpTrigLookback) { AddWhy(why, "A: прокол старше " + IntegerToString(InpTrigLookback) + " свечей"); return false; }
+   if(!(Cv(r, 1, d) > prevLow)) { AddWhy(why, "A: нет закрытия обратно за " + Px(d * prevLow)); return false; }
+   int cls = MathMax(FUClass(r, 1, d), FUClass(r, jp, d));
+   if(cls < 1 && (IsLowerWick(r, jp, d) || IsLowerWick(r, 1, d))) cls = 1;
    if(cls < (int)InpMinFUClass)
      {
-      why = StringFormat("FU класс %s < %s (триггер A)", ClsName(cls), ClsName((int)InpMinFUClass));
+      AddWhy(why, StringFormat("A: FU класс %s < %s", ClsName(cls), ClsName((int)InpMinFUClass)));
       return false;
      }
    FillSig(s, "A", cls, false, pierce, "FU", r[1].time);
@@ -1298,7 +1332,7 @@ bool TriggerB(const SZone &z, const MqlRates &r[], SSig &s, string &why)
      {
       if(!IsFU(r, m, d)) continue;
       double L1 = Lv(r, m, d), b1 = BBot(r, m, d);
-      if(L1 < zl - 2.0 || L1 > zh) continue;
+      if(L1 < zl - InpPierceMax || L1 > zh) continue;
       if(L2 >= L1 - InpHCSTol && L2 <= b1) { cnt++; ext = MathMin(ext, L1); }
      }
    if(cnt == 0) return false;
@@ -1314,33 +1348,47 @@ bool TriggerC(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    if(ng == 0) return false;
    double zl = ZLo(z), zh = ZHi(z);
    double deep = MathMin(Lv(r, 1, d), Lv(r, 2, d));
-   if(deep < zl - 2.0 || deep > zh) return false;
+   if(deep < zl - InpPierceMax || deep > zh) return false;
    FillSig(s, "C", FUClass(r, 1, d), ng == 2, deep, "NEG", r[1].time);
    return true;
   }
 
-// D: снятие равных хаёв/лоёв (swing, Doji) из источника 3 и закрытие обратно за уровнем
+// D: снятие ликвидности (равные уровни, swing, Doji) у зоны и закрытие обратно за уровнем
 bool TriggerD(const SZone &z, const MqlRates &r[], SSig &s, string &why)
   {
-   int d = z.dir;
-   if(z.nLvl == 0) return false;
+   int d = z.dir, n = ArraySize(r);
    double zl = ZLo(z), zh = ZHi(z);
-   double L = Lv(r, 1, d);
-   for(int k = 0; k < z.nLvl; k++)
+   double lv[];
+   int nl = 0;
+   for(int k = 0; k < z.nLvl; k++) { ArrayResize(lv, nl + 1); lv[nl] = d * z.lvl[k]; nl++; }
+   for(int k = 0; k < ArraySize(g_liq); k++)
+      if(g_liqDir[k] == d) { ArrayResize(lv, nl + 1); lv[nl] = d * g_liq[k]; nl++; }
+   int lb = MathMax(1, MathMin(InpTrigLookback, n - 8));
+   bool anyNear = false;
+   for(int k = 0; k < nl; k++)
      {
-      double m = d * z.lvl[k];
-      if(m < zl - 2.0 || m > zh + 2.0) continue;
-      if(!(L < m - InpLqMin && Cv(r, 1, d) > m)) continue;
-      if(!IsLowerWick(r, 1, d))
-        {
-         why = "D: тень сигнальной свечи < " + DoubleToString(InpWickPct, 0) + "%";
-         continue;
-        }
-      int cls = FUClass(r, 1, d);
-      if(cls < 1) { why = "D: нет FU"; continue; }
-      FillSig(s, "D", cls, false, L, "SWEEP", r[1].time);
+      double m = lv[k];
+      if(m < zl - InpPierceMax || m > zh + InpPierceMax) continue;
+      anyNear = true;
+      bool old = false;                       // уровень снят ещё до окна поиска
+      for(int j = lb + 1; j <= lb + 6 && j < n; j++)
+         if(Lv(r, j, d) < m - InpLqMin) { old = true; break; }
+      if(old) continue;
+      int js = -1;
+      for(int j = lb; j >= 1; j--)
+         if(Lv(r, j, d) < m - InpLqMin) { js = j; break; }
+      if(js < 0) continue;
+      if(!(Cv(r, 1, d) > m)) { AddWhy(why, "D: после снятия " + Px(d * m) + " нет закрытия обратно"); continue; }
+      double ext = DBL_MAX;
+      for(int j = 1; j <= js; j++) ext = MathMin(ext, Lv(r, j, d));
+      int cls = MathMax(FUClass(r, 1, d), FUClass(r, js, d));
+      bool wick = IsLowerWick(r, js, d) || IsLowerWick(r, 1, d);
+      if(cls < 1 && !wick) { AddWhy(why, "D: снятие " + Px(d * m) + " без тени и FU"); continue; }
+      if(cls < 1) cls = 1;
+      FillSig(s, "D", cls, false, ext, "SWEEP", r[1].time);
       return true;
      }
+   if(!anyNear) AddWhy(why, "D: нет уровней ликвидности у зоны");
    return false;
   }
 
@@ -1350,7 +1398,7 @@ bool TriggerDirect(const SZone &z, const MqlRates &r[], SSig &s)
    int d = z.dir;
    if(!IsDoji(r, 1) || !IsBIW(r, 2, d)) return false;
    double deep = MathMin(Lv(r, 1, d), Lv(r, 2, d));
-   if(deep < ZLo(z) - 2.0 || deep > ZHi(z)) return false;
+   if(deep < ZLo(z) - InpPierceMax || deep > ZHi(z)) return false;
    FillSig(s, "DIRECT", 0, false, deep, "BIW", r[1].time);
    return true;
   }
@@ -1629,7 +1677,7 @@ void DrawPanel()
   {
    if(!InpDraw) return;
    double sp = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
-   Comment("Mr. Casino v2\n",
+   Comment("Mr. Casino v2.1\n",
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
            "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
@@ -1672,7 +1720,7 @@ bool InRegion(const SZone &z, const MqlRates &r[])
    int d = z.dir;
    double zl = ZLo(z), zh = ZHi(z);
    for(int i = 1; i <= 2; i++)
-      if(Hv(r, i, d) >= zl - 2.0 && Lv(r, i, d) <= zh + 2.0) return true;
+      if(Hv(r, i, d) >= zl - InpPierceMax && Lv(r, i, d) <= zh + InpPierceMax) return true;
    return false;
   }
 
@@ -1989,7 +2037,7 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v2 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v2.1 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
    return INIT_SUCCEEDED;
   }
