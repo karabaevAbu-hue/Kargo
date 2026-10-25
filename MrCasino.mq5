@@ -10,7 +10,7 @@
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "2.10"
+#property version   "2.20"
 #property description "Mr. Casino Flashcards v2: OB/FU/ликвидность -> ближние зоны -> триггеры A-D"
 
 #include <Trade\Trade.mqh>
@@ -70,6 +70,8 @@ input bool            InpUseTrigB       = true;         // B: HCS
 input bool            InpUseTrigC       = true;         // C: Negation
 input bool            InpUseTrigD       = true;         // D: снятие ликвидности
 input bool            InpDirectEntry    = false;        // Прямой вход: BIW + Doji
+input bool            InpUseTrigE       = true;         // E: отбой от зоны (касание + свеча разворота)
+input double          InpTouchWickPct   = 25.0;         // E: мин. тень в сторону зоны, %
 
 input group "Стоп и тейк [§8]"
 input double          InpMaxSL          = 12.0;         // Макс. стоп, пунктов
@@ -1392,6 +1394,24 @@ bool TriggerD(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    return false;
   }
 
+// E: отбой от зоны — свеча коснулась зоны и закрылась в сторону сделки с тенью к зоне
+bool TriggerE(const SZone &z, const MqlRates &r[], SSig &s, string &why)
+  {
+   int d = z.dir;
+   double zl = ZLo(z), zh = ZHi(z);
+   double L = Lv(r, 1, d);
+   if(L > zh) return false;                                   // зону не задела
+   if(L < zl - InpPierceMax) { AddWhy(why, "E: свеча ушла за зону дальше допуска"); return false; }
+   if(!(Cv(r, 1, d) > Ov(r, 1, d))) { AddWhy(why, "E: свеча не развернулась"); return false; }
+   double rg = Rng(r, 1, d);
+   if(rg <= 0) return false;
+   double wick = BBot(r, 1, d) - L;
+   if(wick < InpTouchWickPct / 100.0 * rg) { AddWhy(why, "E: тень к зоне меньше " + DoubleToString(InpTouchWickPct, 0) + "%"); return false; }
+   if(!(Cv(r, 1, d) >= (zl + zh) / 2.0)) { AddWhy(why, "E: закрытие глубоко в зоне"); return false; }
+   FillSig(s, "E", FUClass(r, 1, d), false, L, "TOUCH", r[1].time);
+   return true;
+  }
+
 // Прямой вход: BIW, за которым сразу Doji
 bool TriggerDirect(const SZone &z, const MqlRates &r[], SSig &s)
   {
@@ -1422,6 +1442,9 @@ bool EvalZone(SZone &z, const MqlRates &r[], SSig &s, string &why)
    if(InpUseTrigD && TriggerD(z, r, t, w) && t.pts > best.pts) best = t;
    t.ok = false;
    if(InpUseTrigC && TriggerC(z, r, t, w) && t.pts > best.pts) best = t;
+   t.ok = false;
+   t.ok = false;
+   if(InpUseTrigE && !best.ok && TriggerE(z, r, t, w)) best = t;
    t.ok = false;
    if(InpDirectEntry && !best.ok && TriggerDirect(z, r, t)) best = t;
    if(!best.ok)
@@ -1677,7 +1700,7 @@ void DrawPanel()
   {
    if(!InpDraw) return;
    double sp = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
-   Comment("Mr. Casino v2.1\n",
+   Comment("Mr. Casino v2.2\n",
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
            "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
@@ -2037,7 +2060,7 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v2.1 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v2.2 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
    return INIT_SUCCEEDED;
   }
