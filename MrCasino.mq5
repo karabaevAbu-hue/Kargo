@@ -10,7 +10,7 @@
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "2.20"
+#property version   "2.30"
 #property description "Mr. Casino Flashcards v2: OB/FU/ликвидность -> ближние зоны -> триггеры A-D"
 
 #include <Trade\Trade.mqh>
@@ -25,7 +25,7 @@ input long            InpMagic          = 777001;       // Magic Number
 
 input group "Риск и лот [§2]"
 input ENUM_RISK_MODE  InpRiskMode       = RISK_FIXED;   // Режим риска
-input double          InpFixedLot       = 0.01;         // Лот для FIXED
+input double          InpFixedLot       = 0.05;         // Лот для FIXED
 input double          InpRiskPercent    = 10.0;         // % баланса для PERCENT
 input double          InpMarginReserve  = 30.0;         // Запас свободной маржи, %
 
@@ -33,9 +33,9 @@ input group "Направления и баллы [§4, §6.2]"
 input bool            InpTradeBuy       = true;         // Разрешить BUY
 input bool            InpTradeSell      = true;         // Разрешить SELL
 input bool            InpAllowCounter   = true;         // Сделки COUNTER (против D1 и H4)
-input int             InpMinScoreWith   = 2;            // Мин. балл зоны: WITH
-input int             InpMinScoreMixed  = 3;            // Мин. балл зоны: MIXED / NEUTRAL
-input int             InpMinScoreCounter= 5;            // Мин. балл зоны: COUNTER
+input int             InpMinScoreWith   = 1;            // Мин. балл зоны: WITH
+input int             InpMinScoreMixed  = 1;            // Мин. балл зоны: MIXED / NEUTRAL
+input int             InpMinScoreCounter= 2;            // Мин. балл зоны: COUNTER
 input int             InpRepeatM15Bars  = 2;            // Пауза после стопа в ту же сторону, свечей M15
 
 input group "Зоны [§6]"
@@ -59,7 +59,7 @@ input group "Паттерны [§5]"
 input double          InpDojiBodyPct    = 25.0;         // Тело Doji, % диапазона
 input double          InpWickPct        = 40.0;         // Тень у FU / сигнала D, %
 input double          InpLqMin          = 0.3;          // Прокол экстремума, пунктов
-input ENUM_MIN_FU     InpMinFUClass     = FU_CLASS_B;   // Мин. класс FU для триггера A
+input ENUM_MIN_FU     InpMinFUClass     = FU_CLASS_C;   // Мин. класс FU для триггера A
 input double          InpHCSTol         = 1.0;          // Допуск HCS, пунктов
 input double          InpPierceMax      = 6.0;          // Допуск прокола за край зоны, пунктов
 input int             InpTrigLookback   = 3;            // Свечей M5 на поиск прокола (A, D)
@@ -69,26 +69,27 @@ input bool            InpUseTrigA       = true;         // A: Manipulation Cycle
 input bool            InpUseTrigB       = true;         // B: HCS
 input bool            InpUseTrigC       = true;         // C: Negation
 input bool            InpUseTrigD       = true;         // D: снятие ликвидности
-input bool            InpDirectEntry    = false;        // Прямой вход: BIW + Doji
+input bool            InpDirectEntry    = true;        // Прямой вход: BIW + Doji
 input bool            InpUseTrigE       = true;         // E: отбой от зоны (касание + свеча разворота)
 input double          InpTouchWickPct   = 25.0;         // E: мин. тень в сторону зоны, %
 
 input group "Стоп и тейк [§8]"
-input double          InpMaxSL          = 12.0;         // Макс. стоп, пунктов
+input double          InpMaxSL          = 8.0;         // Макс. стоп, пунктов
 input double          InpMinSL          = 3.0;          // Мин. стоп, пунктов
 input double          InpSLBuffer       = 0.5;          // Буфер стопа сверх спреда
 input double          InpTP             = 40.0;         // Тейк, пунктов
-input double          InpMinRR          = 1.5;          // Мин. тейк/стоп
+input double          InpMinRR          = 1.0;          // Мин. тейк/стоп
+input double          InpMinTargetDist  = 8.0;          // Ликвидность ближе N пунктов не считается целью/препятствием
 input double          InpBEAt           = 15.0;         // Безубыток: N пунктов или 50% пути до тейка
 input double          InpBEOffset       = 0.5;          // Стоп в безубытке = вход + N
 input bool            InpPartial        = false;        // 50% на первой LAL (лот от 0.02)
 input int             InpFridayMin      = 30;           // Закрыть позиции за N минут до закрытия в пятницу
 
 input group "Фильтры и лимиты [§9]"
-input int             InpMaxTradesDay   = 3;            // Сделок в день
-input int             InpMaxCounterDay  = 1;            // Из них COUNTER
+input int             InpMaxTradesDay   = 6;            // Сделок в день
+input int             InpMaxCounterDay  = 3;            // Из них COUNTER
 input double          InpDailyTarget    = 40.0;         // Дневная цель, пунктов
-input int             InpMaxLossStreak  = 2;            // Стопов подряд до паузы
+input int             InpMaxLossStreak  = 3;            // Стопов подряд до паузы
 input double          InpMaxSpread      = 0.5;          // Макс. спред
 input double          InpMaxSlip        = 0.3;          // Проскальзывание (deviation)
 input string          InpSessionStart   = "10:00";      // Начало входов (Бишкек)
@@ -101,7 +102,7 @@ input string          InpNewsTimes      = "";           // Новости "ГГ�
 input int             InpNewsMinutes    = 30;           // Окно вокруг новости, минут
 
 input group "Лог, график, уведомления [§10]"
-input int             InpLogLevel       = 1;            // 0 сделки, 1 зоны и пропуски, 2 подробно
+input int             InpLogLevel       = 2;            // 0 сделки, 1 зоны и пропуски, 2 подробно
 input bool            InpPush           = true;         // Push в MT5 на iPhone
 input string          InpTgToken        = "";           // Telegram bot token
 input string          InpTgChatId       = "";           // Telegram chat id
@@ -651,7 +652,7 @@ bool InsideFVG(const MqlRates &r[])
 // Ближайшая Major ликвидность в сторону сделки (Doji, ровные уровни, верх FU, FVG); 0 если нет
 double FindMajorLiq(int d, double entry)
   {
-   double e = d * entry + 0.5;
+   double e = d * entry + MathMax(0.5, InpMinTargetDist);
    double best = DBL_MAX;
    ENUM_TIMEFRAMES tfs[3] = {PERIOD_M15, PERIOD_H1, PERIOD_H4};
    int cnts[3] = {200, 120, 60};
@@ -1700,7 +1701,7 @@ void DrawPanel()
   {
    if(!InpDraw) return;
    double sp = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
-   Comment("Mr. Casino v2.2\n",
+   Comment("Mr. Casino v2.3\n",
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
            "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
@@ -2060,7 +2061,7 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v2.2 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v2.3 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
    return INIT_SUCCEEDED;
   }
