@@ -10,7 +10,7 @@
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "2.30"
+#property version   "2.40"
 #property description "Mr. Casino Flashcards v2: OB/FU/ликвидность -> ближние зоны -> триггеры A-D"
 
 #include <Trade\Trade.mqh>
@@ -74,13 +74,14 @@ input bool            InpUseTrigE       = true;         // E: отбой от з
 input double          InpTouchWickPct   = 25.0;         // E: мин. тень в сторону зоны, %
 
 input group "Стоп и тейк [§8]"
-input double          InpMaxSL          = 8.0;         // Макс. стоп, пунктов
-input double          InpMinSL          = 3.0;          // Мин. стоп, пунктов
+input double          InpMaxSL          = 15.0;         // Макс. стоп, пунктов
+input double          InpMinSL          = 10.0;          // Мин. стоп, пунктов
 input double          InpSLBuffer       = 0.5;          // Буфер стопа сверх спреда
 input double          InpTP             = 40.0;         // Тейк, пунктов
+input bool            InpCapTP          = false;        // Урезать тейк до встречной зоны/ликвидности
 input double          InpMinRR          = 1.0;          // Мин. тейк/стоп
 input double          InpMinTargetDist  = 8.0;          // Ликвидность ближе N пунктов не считается целью/препятствием
-input double          InpBEAt           = 15.0;         // Безубыток: N пунктов или 50% пути до тейка
+input double          InpBEAt           = 20.0;         // Безубыток: N пунктов или 50% пути до тейка
 input double          InpBEOffset       = 0.5;          // Стоп в безубытке = вход + N
 input bool            InpPartial        = false;        // 50% на первой LAL (лот от 0.02)
 input int             InpFridayMin      = 30;           // Закрыть позиции за N минут до закрытия в пятницу
@@ -1701,7 +1702,7 @@ void DrawPanel()
   {
    if(!InpDraw) return;
    double sp = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
-   Comment("Mr. Casino v2.3\n",
+   Comment("Mr. Casino v2.4\n",
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
            "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
@@ -1804,7 +1805,7 @@ void TryEntry()
    string obSrc;
    double obst = NearestObstacle(d, entry, major, obSrc);
    double tpDist = InpTP;
-   if(obst > 0 && obst - 1.0 < tpDist) tpDist = obst - 1.0;
+   if(InpCapTP && obst > 0 && obst - 1.0 < tpDist) tpDist = obst - 1.0;
    if(tpDist < MinStopDist() || tpDist / dist < InpMinRR)
      {
       Skip(bi, StringFormat("RR %.1f < %.1f (тейк %.1f, стоп %.1f%s)", tpDist / dist, InpMinRR, tpDist, dist,
@@ -2061,7 +2062,7 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v2.3 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v2.4 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
    return INIT_SUCCEEDED;
   }
