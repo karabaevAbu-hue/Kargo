@@ -10,7 +10,7 @@
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "3.00"
+#property version   "3.10"
 #property description "Mr. Casino v3 (золото): зоны OB/FU/ликвидность -> манипуляция A-D + свечи из книги (K) -> стоп True Stop, тейк LAL 10-30, 2 сделки в день"
 
 #include <Trade\Trade.mqh>
@@ -62,7 +62,9 @@ input double          InpLqMinPt        = 0.3;          // Прокол экст
 input ENUM_MIN_FU     InpMinFUClass     = FU_CLASS_B;   // Мин. класс FU для триггера A
 input double          InpHCSTolPt       = 1.0;          // Допуск HCS, пунктов
 input double          InpPierceMaxPt    = 6.0;          // Допуск прокола за край зоны, пунктов
-input int             InpTrigLookback   = 3;            // Свечей M5 на поиск прокола (A, D)
+input int             InpTrigLookback   = 3;            // Свечей M5 на поиск прокола (A)
+input double          InpSweepMaxPt     = 12.0;         // Заход (стоп-хант) за край зоны: до N пунктов
+input int             InpSweepBars      = 6;            // D: заход за уровень — до N свечей M5
 
 input group "Триггеры [§7]"
 input bool            InpUseTrigA       = true;         // A: Manipulation Cycle
@@ -83,7 +85,7 @@ input string          InpQuotaFrom      = "16:00";      // Добор с (Биш
 
 input group "Стоп и тейк [§8]"
 input double          InpMinSLPt        = 5.0;          // Мин. стоп, пунктов
-input double          InpMaxSLPt        = 12.0;         // Макс. стоп, пунктов
+input double          InpMaxSLPt        = 15.0;         // Макс. стоп, пунктов
 input double          InpSLBufferPt     = 0.5;          // Буфер стопа сверх спреда
 input bool            InpTrueStop       = true;         // Стоп за дальним краем зоны (True Stop), если влезает
 input double          InpTPMinPt        = 10.0;         // Тейк: мин., пунктов
@@ -136,6 +138,7 @@ bool       g_crypto = false;
 #define InpLqMin           (InpLqMinPt * g_k)
 #define InpHCSTol          (InpHCSTolPt * g_k)
 #define InpPierceMax       (InpPierceMaxPt * g_k)
+#define InpSweepMax        (InpSweepMaxPt * g_k)
 #define InpMaxSL           (InpMaxSLPt * g_k)
 #define InpMinSL           (InpMinSLPt * g_k)
 #define InpSLBuffer        (InpSLBufferPt * g_k)
@@ -674,11 +677,12 @@ bool ZoneInFVG(double lo, double hi)
    return false;
   }
 
-// Сигнальная свеча M5 внутри незакрытого FVG 3+ пункта
-bool InsideFVG(const MqlRates &r[])
+// Разворот не должен начинаться из имбаланса [§9]: точка разворота (крайняя точка манипуляции)
+// внутри незакрытого FVG M5 шириной 3+ пункта. Закрытие внутри дыры не мешает — дыра это цель.
+bool InsideFVG(const MqlRates &r[], double price)
   {
    int n = ArraySize(r);
-   double c = r[1].close;
+   double c = price;
    for(int k = 3; k < MathMin(n - 1, 45); k++)
      {
       double bot = r[k + 1].high, top = r[k - 1].low;
@@ -1393,9 +1397,9 @@ bool TriggerA(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    for(int q = 1; q < k; q++)
       if(Lv(r, q, d) < pierce) { pierce = Lv(r, q, d); jp = q; }
    if(jp < 0 || !(pierce < prevLow)) { AddWhy(why, "A: точка 1 " + Px(d * prevLow) + " не проколота"); return false; }
-   if(pierce < zl - InpPierceMax)
+   if(pierce < zl - InpSweepMax)
      {
-      AddWhy(why, StringFormat("A: прокол %s дальше допуска %s", Px(d * pierce), Px(d * (zl - InpPierceMax))));
+      AddWhy(why, StringFormat("A: прокол %s дальше допуска %s", Px(d * pierce), Px(d * (zl - InpSweepMax))));
       return false;
      }
    if(jp > InpTrigLookback) { AddWhy(why, "A: прокол старше " + IntegerToString(InpTrigLookback) + " свечей"); return false; }
@@ -1441,42 +1445,74 @@ bool TriggerC(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    if(ng == 0) return false;
    double zl = ZLo(z), zh = ZHi(z);
    double deep = MathMin(Lv(r, 1, d), Lv(r, 2, d));
-   if(deep < zl - InpPierceMax || deep > zh) return false;
+   if(deep < zl - InpSweepMax || deep > zh) return false;
    FillSig(s, "C", FUClass(r, 1, d), ng == 2, deep, "NEG", r[1].time);
    return true;
   }
 
-// D: снятие ликвидности (равные уровни, swing, Doji) у зоны и закрытие обратно за уровнем
+// D: снятие ликвидности у зоны — Manipulation Cycle [§8]. Точка 2: цена ушла за уровень
+// ликвидности (равные хаи/лои, swing, Doji) одной или несколькими свечами подряд (до InpSweepBars),
+// точка 3: закрытие M5 обратно за уровень — вход. Если свеча возврата была Doji (книга: ждать),
+// вход ещё на следующей свече, если она тоже закрылась за уровнем. Стоп — за крайней точкой захода.
 bool TriggerD(const SZone &z, const MqlRates &r[], SSig &s, string &why)
   {
    int d = z.dir, n = ArraySize(r);
+   if(n < InpSweepBars + 20) return false;
    double zl = ZLo(z), zh = ZHi(z);
    double lv[];
    int nl = 0;
    for(int k = 0; k < z.nLvl; k++) { ArrayResize(lv, nl + 1); lv[nl] = d * z.lvl[k]; nl++; }
    for(int k = 0; k < ArraySize(g_liq); k++)
       if(g_liqDir[k] == d) { ArrayResize(lv, nl + 1); lv[nl] = d * g_liq[k]; nl++; }
-   int lb = MathMax(1, MathMin(InpTrigLookback, n - 8));
    bool anyNear = false;
    for(int k = 0; k < nl; k++)
      {
       double m = lv[k];
       if(m < zl - InpPierceMax || m > zh + InpPierceMax) continue;
       anyNear = true;
-      bool old = false;                       // уровень снят ещё до окна поиска
-      for(int j = lb + 1; j <= lb + 6 && j < n; j++)
+      // точка 3: свеча возврата jr (последняя или предыдущая)
+      int jr = 0;
+      if(Cv(r, 1, d) > m)
+        {
+         if(Cv(r, 2, d) <= m || Lv(r, 1, d) < m - InpLqMin) jr = 1;
+         else if(Cv(r, 3, d) <= m || Lv(r, 2, d) < m - InpLqMin) jr = 2;
+        }
+      else if(Lv(r, 1, d) < m)
+         AddWhy(why, "D: после снятия " + Px(d * m) + " нет закрытия обратно");
+      if(jr == 0) continue;
+      // точка 2: свечи за уровнем до возврата (закрытие за уровнем или прокол)
+      int ks = jr;
+      bool tooLong = false;
+      for(int j = jr + 1; j < n - 1; j++)
+        {
+         if(!(Cv(r, j, d) <= m || Lv(r, j, d) < m - InpLqMin)) break;
+         ks = j;
+         if(j - jr > InpSweepBars) { tooLong = true; break; }
+        }
+      if(tooLong)
+        {
+         AddWhy(why, StringFormat("D: за уровнем %s дольше %d свечей — пробой, не заход", Px(d * m), InpSweepBars));
+         continue;
+        }
+      bool old = false;                       // уровень уже снимали в последний час до этого захода
+      for(int j = ks + 1; j <= ks + 12 && j < n; j++)
          if(Lv(r, j, d) < m - InpLqMin) { old = true; break; }
       if(old) continue;
-      int js = -1;
-      for(int j = lb; j >= 1; j--)
-         if(Lv(r, j, d) < m - InpLqMin) { js = j; break; }
-      if(js < 0) continue;
-      if(!(Cv(r, 1, d) > m)) { AddWhy(why, "D: после снятия " + Px(d * m) + " нет закрытия обратно"); continue; }
       double ext = DBL_MAX;
-      for(int j = 1; j <= js; j++) ext = MathMin(ext, Lv(r, j, d));
-      int cls = MathMax(FUClass(r, 1, d), FUClass(r, js, d));
-      bool wick = IsLowerWick(r, js, d) || IsLowerWick(r, 1, d);
-      if(cls < 1 && !wick) { AddWhy(why, "D: снятие " + Px(d * m) + " без тени и FU"); continue; }
+      int cls = 0;
+      bool wick = false;
+      for(int j = 1; j <= ks; j++)
+        {
+         ext = MathMin(ext, Lv(r, j, d));
+         cls = MathMax(cls, FUClass(r, j, d));
+         if(IsLowerWick(r, j, d)) wick = true;
+        }
+      if(ext < zl - InpSweepMax)
+        {
+         AddWhy(why, StringFormat("D: заход до %s дальше допуска %s", Px(d * ext), Px(d * (zl - InpSweepMax))));
+         continue;
+        }
+      if(cls < 1 && !wick) { AddWhy(why, "D: заход за " + Px(d * m) + " без FU и тени"); continue; }
       if(cls < 1) cls = 1;
       FillSig(s, "D", cls, false, ext, "SWEEP", r[1].time);
       return true;
@@ -1539,7 +1575,7 @@ bool TriggerK(const SZone &z, const MqlRates &r[], SSig &s, string &why)
       if(IsPin(r, 2, d) && Cv(r, 1, d) > Ov(r, 1, d) && Cv(r, 1, d) > BTop(r, 2, d))
         {
          ext = MathMin(Lv(r, 2, d), Lv(r, 1, d));
-         if(ext >= zl - InpPierceMax && ext <= zh)
+         if(ext >= zl - InpSweepMax && ext <= zh)
            {
             FillSig(s, "K", MathMax(FUClass(r, 2, d), 1), false, ext, d > 0 ? "HAMMER" : "STAR", r[1].time);
             return true;
@@ -1549,7 +1585,7 @@ bool TriggerK(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    else if(IsPin(r, 1, d))
      {
       ext = Lv(r, 1, d);
-      if(ext >= zl - InpPierceMax && ext <= zh)
+      if(ext >= zl - InpSweepMax && ext <= zh)
         {
          FillSig(s, "K", MathMax(FUClass(r, 1, d), 1), false, ext, d > 0 ? "HAMMER" : "STAR", r[1].time);
          return true;
@@ -1559,7 +1595,7 @@ bool TriggerK(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    if(Cv(r, 2, d) < Ov(r, 2, d) && IsEngulf(r, 1, d))
      {
       ext = MathMin(Lv(r, 1, d), Lv(r, 2, d));
-      if(ext >= zl - InpPierceMax && ext <= zh)
+      if(ext >= zl - InpSweepMax && ext <= zh)
         {
          FillSig(s, "K", MathMax(FUClass(r, 1, d), 1), false, ext, "ENGULF", r[1].time);
          return true;
@@ -1569,7 +1605,7 @@ bool TriggerK(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    if(IsStar3(r, d))
      {
       ext = MathMin(Lv(r, 1, d), MathMin(Lv(r, 2, d), Lv(r, 3, d)));
-      if(ext >= zl - InpPierceMax && ext <= zh)
+      if(ext >= zl - InpSweepMax && ext <= zh)
         {
          FillSig(s, "K", MathMax(FUClass(r, 1, d), 1), false, ext, d > 0 ? "MSTAR" : "ESTAR", r[1].time);
          return true;
@@ -1868,7 +1904,7 @@ void DrawPanel()
   {
    if(!InpDraw) return;
    double sp = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
-   Comment("Mr. Casino v3 (золото)\n",
+   Comment("Mr. Casino v3.1 (золото)\n",
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
            "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")", Relaxed() ? " · добор" : "", "\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
@@ -1972,7 +2008,7 @@ void TryEntry()
 
    int d = g_zones[bi].dir;
    SZone z = g_zones[bi];
-   if(InsideFVG(r)) { Skip(bi, "сигнальная свеча внутри незакрытого FVG (триггер " + bs.trig + ")"); return; }
+   if(InsideFVG(r, d * bs.ext)) { Skip(bi, "разворот начался внутри незакрытого FVG (триггер " + bs.trig + ")"); return; }
    if(InpDojiWait && bs.trig != "DIRECT" && IsDoji(r, 1))
      { Skip(bi, "сигнальная свеча Doji — ждём (книга, триггер " + bs.trig + ")"); return; }
    if(ImpulseInto(r, d))
@@ -2270,7 +2306,7 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v3 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v3.1 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
    return INIT_SUCCEEDED;
   }
