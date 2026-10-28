@@ -1,17 +1,17 @@
 //+------------------------------------------------------------------+
 //|                                                    MrCasino.mq5 |
 //|   Советник MT5 по стратегии Mr. Casino (Flashcards), золото      |
-//|   v2: ближние зоны, BUY и SELL, триггер D, подробный лог         |
-//|   Реализация "ТЗ v2: робот MT5 Mr. Casino - ближние зоны,        |
-//|   BUY и SELL". Разделы ТЗ помечены как [§N].                     |
+//|   v3: только золото, 2 сделки в день, стоп True Stop,            |
+//|   тейк LAL 10-30, свечи и дисциплина из книги "Oddiy savdo       |
+//|   kitobi". Разделы ТЗ v2 помечены как [§N].                      |
 //|                                                                  |
 //|   Единицы: 1 пункт = $1 цены золота (пороги в ценовых единицах). |
 //|   Внутри паттерны и зоны считаются для BUY ("бычья логика");     |
 //|   для SELL цены зеркалятся (аксессоры Ov/Hv/Lv/Cv с d = -1).     |
 //+------------------------------------------------------------------+
 #property copyright "Consigliere"
-#property version   "2.50"
-#property description "Mr. Casino Flashcards v2: OB/FU/ликвидность -> ближние зоны -> триггеры A-D"
+#property version   "3.00"
+#property description "Mr. Casino v3 (золото): зоны OB/FU/ликвидность -> манипуляция A-D + свечи из книги (K) -> стоп True Stop, тейк LAL 10-30, 2 сделки в день"
 
 #include <Trade\Trade.mqh>
 
@@ -20,9 +20,8 @@ enum ENUM_MIN_FU    { FU_CLASS_A = 3, FU_CLASS_B = 2, FU_CLASS_C = 1 };
 
 //--- входные параметры [§11]
 input group "Символ и метка"
-input string          InpSymbol         = "";           // Символ (пусто = символ графика)
+input string          InpSymbol         = "";           // Символ (пусто = график; только золото)
 input long            InpMagic          = 777001;       // Magic Number
-input double          InpPointScale     = 0.0;          // Масштаб пунктов: 0 = авто (золото ×1, BTC ×40)
 
 input group "Риск и лот [§2]"
 input ENUM_RISK_MODE  InpRiskMode       = RISK_FIXED;   // Режим риска
@@ -34,35 +33,35 @@ input group "Направления и баллы [§4, §6.2]"
 input bool            InpTradeBuy       = true;         // Разрешить BUY
 input bool            InpTradeSell      = true;         // Разрешить SELL
 input bool            InpAllowCounter   = true;         // Сделки COUNTER (против D1 и H4)
-input int             InpMinScoreWith   = 1;            // Мин. балл зоны: WITH
-input int             InpMinScoreMixed  = 1;            // Мин. балл зоны: MIXED / NEUTRAL
-input int             InpMinScoreCounter= 2;            // Мин. балл зоны: COUNTER
+input int             InpMinScoreWith   = 2;            // Мин. балл зоны: WITH
+input int             InpMinScoreMixed  = 3;            // Мин. балл зоны: MIXED / NEUTRAL
+input int             InpMinScoreCounter= 5;            // Мин. балл зоны: COUNTER
 input int             InpRepeatM15Bars  = 2;            // Пауза после стопа в ту же сторону, свечей M15
 
 input group "Зоны [§6]"
-input double          InpZoneRadiusPt     = 60.0;         // Радиус поиска зон от цены, пунктов
+input double          InpZoneRadiusPt   = 60.0;         // Радиус поиска зон от цены, пунктов
 input int             InpMaxZonesSide   = 3;            // Зон на сторону
 input bool            InpUseM15OB       = true;         // OB на M15
 input double          InpOBWickPct      = 45.0;         // Макс. сумма теней свечи OB, %
 input int             InpOBMoveBars     = 6;            // Свечей на уход цены от OB
 input bool            InpOBNeedFU       = false;        // FU после OB обязателен
-input double          InpFUZoneMinWickPt  = 3.0;          // Мин. тень FU для зоны из тени
-input double          InpSweepZonePt      = 6.0;          // Зона за уровнем ликвидности
-input double          InpEqTolPt          = 1.0;          // Допуск равных хаёв/лоёв
-input double          InpZoneMaxPt        = 10.0;         // Макс. ширина зоны
-input double          InpZoneMinPt        = 3.0;          // Мин. ширина зоны
-input double          InpConfirmAwayPt    = 10.0;         // Отход от зоны для CONFIRMED
-input double          InpInvalidBeyondPt  = 2.0;          // Закрытие M15 за дальним краем для INVALID
+input double          InpFUZoneMinWickPt= 3.0;          // Мин. тень FU для зоны из тени
+input double          InpSweepZonePt    = 6.0;          // Зона за уровнем ликвидности
+input double          InpEqTolPt        = 1.0;          // Допуск равных хаёв/лоёв
+input double          InpZoneMaxPt      = 10.0;         // Макс. ширина зоны
+input double          InpZoneMinPt      = 3.0;          // Мин. ширина зоны
+input double          InpConfirmAwayPt  = 10.0;         // Отход от зоны для CONFIRMED (ретест)
+input double          InpInvalidBeyondPt= 2.0;          // Закрытие M15 за дальним краем для INVALID
 input int             InpZoneLifeHours  = 48;           // Срок жизни зоны, часов
 input int             InpZoneLifeM15    = 24;           // Срок жизни зоны M15, часов
 
 input group "Паттерны [§5]"
 input double          InpDojiBodyPct    = 25.0;         // Тело Doji, % диапазона
 input double          InpWickPct        = 40.0;         // Тень у FU / сигнала D, %
-input double          InpLqMinPt          = 0.3;          // Прокол экстремума, пунктов
-input ENUM_MIN_FU     InpMinFUClass     = FU_CLASS_C;   // Мин. класс FU для триггера A
-input double          InpHCSTolPt         = 1.0;          // Допуск HCS, пунктов
-input double          InpPierceMaxPt      = 6.0;          // Допуск прокола за край зоны, пунктов
+input double          InpLqMinPt        = 0.3;          // Прокол экстремума, пунктов
+input ENUM_MIN_FU     InpMinFUClass     = FU_CLASS_B;   // Мин. класс FU для триггера A
+input double          InpHCSTolPt       = 1.0;          // Допуск HCS, пунктов
+input double          InpPierceMaxPt    = 6.0;          // Допуск прокола за край зоны, пунктов
 input int             InpTrigLookback   = 3;            // Свечей M5 на поиск прокола (A, D)
 
 input group "Триггеры [§7]"
@@ -70,30 +69,40 @@ input bool            InpUseTrigA       = true;         // A: Manipulation Cycle
 input bool            InpUseTrigB       = true;         // B: HCS
 input bool            InpUseTrigC       = true;         // C: Negation
 input bool            InpUseTrigD       = true;         // D: снятие ликвидности
-input bool            InpDirectEntry    = true;        // Прямой вход: BIW + Doji
-input bool            InpUseTrigE       = true;         // E: отбой от зоны (касание + свеча разворота)
+input bool            InpUseBook        = true;         // K: свечи из книги (молот/звезда, поглощение, утр./веч. звезда)
+input bool            InpBookConfirm    = true;         // K: молот/падающая звезда — вход после свечи-подтверждения
+input bool            InpUseTrigE       = false;        // E: отбой от зоны всегда (в доборе включается сам)
 input double          InpTouchWickPct   = 25.0;         // E: мин. тень в сторону зоны, %
+input bool            InpDirectEntry    = false;        // Прямой вход: BIW + Doji
+
+input group "Книга: дисциплина"
+input bool            InpDojiWait       = true;         // Сигнальная свеча Doji — не входить, ждать
+input double          InpImpulsePt      = 12.0;         // 3 свечи подряд в зону на N+ пунктов — ждать ретест (0 = выкл)
+input bool            InpQuota          = true;         // Добор: сделок меньше лимита — после времени ниже правила мягче
+input string          InpQuotaFrom      = "16:00";      // Добор с (Бишкек)
 
 input group "Стоп и тейк [§8]"
-input double          InpMaxSLPt          = 15.0;         // Макс. стоп, пунктов
-input double          InpMinSLPt          = 10.0;          // Мин. стоп, пунктов
-input double          InpSLBufferPt       = 0.5;          // Буфер стопа сверх спреда
-input double          InpTPPt             = 40.0;         // Тейк, пунктов
-input bool            InpCapTP          = false;        // Урезать тейк до встречной зоны/ликвидности
-input double          InpMinRR          = 1.0;          // Мин. тейк/стоп
-input double          InpMinTargetDistPt  = 8.0;          // Ликвидность ближе N пунктов не считается целью/препятствием
-input double          InpBEAtPt           = 20.0;         // Безубыток: N пунктов или 50% пути до тейка
-input double          InpBEOffsetPt       = 0.5;          // Стоп в безубытке = вход + N
+input double          InpMinSLPt        = 5.0;          // Мин. стоп, пунктов
+input double          InpMaxSLPt        = 12.0;         // Макс. стоп, пунктов
+input double          InpSLBufferPt     = 0.5;          // Буфер стопа сверх спреда
+input bool            InpTrueStop       = true;         // Стоп за дальним краем зоны (True Stop), если влезает
+input double          InpTPMinPt        = 10.0;         // Тейк: мин., пунктов
+input double          InpTPMaxPt        = 30.0;         // Тейк: макс., пунктов
+input double          InpMinRR          = 1.5;          // Мин. тейк/стоп
+input double          InpRRTarget       = 3.0;          // Тейк без цели-ликвидности: стоп × N (книга 1:3)
+input double          InpBEFrac         = 0.66;         // Безубыток после доли пути до тейка (0 = выкл)
+input double          InpBEOffsetPt     = 0.5;          // Стоп в безубытке = вход + N
+input bool            InpEarlyExit      = true;         // Ранний выход по Negation на M15
 input bool            InpPartial        = false;        // 50% на первой LAL (лот от 0.02)
 input int             InpFridayMin      = 30;           // Закрыть позиции за N минут до закрытия в пятницу
 
 input group "Фильтры и лимиты [§9]"
-input int             InpMaxTradesDay   = 6;            // Сделок в день
-input int             InpMaxCounterDay  = 3;            // Из них COUNTER
-input double          InpDailyTargetPt    = 40.0;         // Дневная цель, пунктов
-input int             InpMaxLossStreak  = 3;            // Стопов подряд до паузы
-input double          InpMaxSpreadPt      = 0.5;          // Макс. спред
-input double          InpMaxSlipPt        = 0.3;          // Проскальзывание (deviation)
+input int             InpMaxTradesDay   = 2;            // Сделок в день
+input int             InpMaxCounterDay  = 1;            // Из них COUNTER
+input double          InpDailyTargetPt  = 0.0;          // Дневная цель, пунктов (0 = выкл)
+input int             InpMaxLossStreak  = 2;            // Стопов подряд до паузы
+input double          InpMaxSpreadPt    = 0.5;          // Макс. спред
+input double          InpMaxSlipPt      = 0.3;          // Проскальзывание (deviation)
 input string          InpSessionStart   = "10:00";      // Начало входов (Бишкек)
 input string          InpSessionEnd     = "23:00";      // Конец входов (Бишкек)
 input string          InpLondonStart    = "13:00";      // Метка LONDON с (Бишкек)
@@ -104,16 +113,14 @@ input string          InpNewsTimes      = "";           // Новости "ГГ�
 input int             InpNewsMinutes    = 30;           // Окно вокруг новости, минут
 
 input group "Лог, график, уведомления [§10]"
-input int             InpLogLevel       = 2;            // 0 сделки, 1 зоны и пропуски, 2 подробно
+input int             InpLogLevel       = 1;            // 0 сделки, 1 зоны и пропуски, 2 подробно
 input bool            InpPush           = true;         // Push в MT5 на iPhone
 input string          InpTgToken        = "";           // Telegram bot token
 input string          InpTgChatId       = "";           // Telegram chat id
 input bool            InpDraw           = true;         // Рисовать зоны на графике
-input string          InpLogFile        = "MrCasino_v2_trades.csv"; // CSV-лог (MQL5/Files)
-input bool            InpEarlyExit      = true;         // Ранний выход по Negation на M15
+input string          InpLogFile        = "MrCasino_v3_trades.csv"; // CSV-лог (MQL5/Files)
 
-//--- масштаб под инструмент: все расстояния в inputs заданы для золота (1 пункт = $1),
-//--- для другого символа они умножаются на g_k (BTC ×40). Спред — на g_ks.
+//--- робот только для золота: 1 пункт = $1, множители = 1
 double     g_k      = 1.0;
 double     g_ks     = 1.0;
 bool       g_crypto = false;
@@ -132,13 +139,13 @@ bool       g_crypto = false;
 #define InpMaxSL           (InpMaxSLPt * g_k)
 #define InpMinSL           (InpMinSLPt * g_k)
 #define InpSLBuffer        (InpSLBufferPt * g_k)
-#define InpTP              (InpTPPt * g_k)
-#define InpBEAt            (InpBEAtPt * g_k)
+#define InpTPMin           (InpTPMinPt * g_k)
+#define InpTPMax           (InpTPMaxPt * g_k)
 #define InpBEOffset        (InpBEOffsetPt * g_k)
-#define InpMinTargetDist   (InpMinTargetDistPt * g_k)
 #define InpDailyTarget     (InpDailyTargetPt * g_k)
 #define InpMaxSpread       (InpMaxSpreadPt * g_ks)
 #define InpMaxSlip         (InpMaxSlipPt * g_k)
+#define InpImpulse         (InpImpulsePt * g_k)
 
 //--- константы
 #define ZONE_NEW        0
@@ -234,9 +241,11 @@ int        g_markIdx    = 0;
 string     g_lastSkip   = "-";
 double     g_liq[];                // неснятые уровни ликвидности, реальные цены
 int        g_liqDir[];
+bool       g_liqMajor[];               // Major: равные уровни, Doji (цель для тейка)
 string     g_lk[];
 int        g_cntDayKey  = -1;
 int        g_cntToday   = 0;
+int        g_quotaMin   = 0;        // начало добора, минуты Бишкека
 int        g_rebuildId  = 0;
 
 // открытая позиция робота
@@ -487,6 +496,15 @@ bool InSession()
    return mins >= g_sessStart || mins < g_sessEnd;
   }
 
+// Добор до лимита сделок [план: 2 сделки в день]: после InpQuotaFrom, если сделок меньше лимита,
+// правила мягче — FU класс C для A, балл зоны −1, вход E (отбой от зоны). Зона и сигнал нужны всегда.
+bool Relaxed()
+  {
+   if(!InpQuota) return false;
+   if(g_day.trades >= InpMaxTradesDay) return false;
+   return InSession() && LocalMinutes() >= g_quotaMin;
+  }
+
 string SessionName()
   {
    int m = LocalMinutes();
@@ -581,9 +599,11 @@ int TradeType(int d)
 
 int MinScore(int tp)
   {
-   if(tp == T_WITH) return InpMinScoreWith;
-   if(tp == T_COUNTER) return InpMinScoreCounter;
-   return InpMinScoreMixed;
+   int m = InpMinScoreMixed;
+   if(tp == T_WITH) m = InpMinScoreWith;
+   else if(tp == T_COUNTER) m = InpMinScoreCounter;
+   if(Relaxed()) m = MathMax(1, m - 1);
+   return m;
   }
 
 //+------------------------------------------------------------------+
@@ -684,7 +704,7 @@ bool InsideFVG(const MqlRates &r[])
 // Ближайшая Major ликвидность в сторону сделки (Doji, ровные уровни, верх FU, FVG); 0 если нет
 double FindMajorLiq(int d, double entry)
   {
-   double e = d * entry + MathMax(PT(0.5), InpMinTargetDist);
+   double e = d * entry + PT(3.0);
    double best = DBL_MAX;
    ENUM_TIMEFRAMES tfs[3] = {PERIOD_M15, PERIOD_H1, PERIOD_H4};
    int cnts[3] = {200, 120, 60};
@@ -735,30 +755,59 @@ double FindMajorLiq(int d, double entry)
    return best == DBL_MAX ? 0.0 : d * best;
   }
 
-// Ближайшее препятствие в сторону сделки: зона CONFIRMED противоположной стороны или Major-ликвидность.
-// Возвращает расстояние в пунктах (0 если нет), в src - что это.
-double NearestObstacle(int d, double entry, double major, string &src)
+void AddTarget(double &c[], string &cn[], double lvl, string name)
   {
-   double best = 0;
-   src = "";
-   if(major > 0)
-     {
-      best = d * (major - entry);
-      src = "ликвидность " + Px(major);
-     }
+   int n = ArraySize(c);
+   ArrayResize(c, n + 1);
+   ArrayResize(cn, n + 1);
+   c[n] = lvl;
+   cn[n] = name;
+  }
+
+// Тейк по стратегии (LAL — первая крупная ликвидность после манипуляции [§9]): ближайшая цель
+// в сторону сделки — равные хаи/лои, Doji, незакрытый имбаланс, край встречной зоны CONFIRMED —
+// в пределах [InpTPMin, InpTPMax] и с RR не ниже InpMinRR. Нет цели — стоп × InpRRTarget (книга 1:3)
+// в тех же пределах. Возвращает дистанцию тейка, src — что за цель.
+double ChooseTP(int d, double entry, double dist, string &src)
+  {
+   double e = d * entry;
+   double c[];
+   string cn[];
+   for(int k = 0; k < ArraySize(g_liq); k++)
+      if(g_liqDir[k] == -d && g_liqMajor[k]) AddTarget(c, cn, d * g_liq[k], "ликвидность " + Px(g_liq[k]));
    for(int i = 0; i < ArraySize(g_zones); i++)
      {
       if(g_zones[i].dir != -d || g_zones[i].status != ZONE_CONFIRMED) continue;
       double edge = d > 0 ? g_zones[i].lo : g_zones[i].hi;
-      double dist = d * (edge - entry);
-      if(dist <= 0) continue;
-      if(best <= 0 || dist < best)
+      AddTarget(c, cn, d * edge, StringFormat("зона %s %s–%s", DirName(-d), Px(g_zones[i].lo), Px(g_zones[i].hi)));
+     }
+   ENUM_TIMEFRAMES ft[3] = {PERIOD_M5, PERIOD_M15, PERIOD_H1};
+   for(int t = 0; t < 3; t++)
+     {
+      MqlRates r[];
+      int n = Load(ft[t], 150, r);
+      for(int k = 2; k < n - 1; k++)
         {
-         best = dist;
-         src = StringFormat("зона %s %s–%s", DirName(-d), Px(g_zones[i].lo), Px(g_zones[i].hi));
+         double bottom = Hv(r, k - 1, d), topg = Lv(r, k + 1, d);
+         if(topg - bottom < PT(1.0)) continue;
+         bool filled = false;
+         for(int q = k - 2; q >= 1; q--)
+            if(Hv(r, q, d) >= topg) { filled = true; break; }
+         if(!filled) AddTarget(c, cn, bottom, "имбаланс " + TFName(ft[t]) + " " + Px(d * bottom));
         }
      }
-   return best;
+   double best = DBL_MAX;
+   src = "";
+   for(int k = 0; k < ArraySize(c); k++)
+     {
+      double dd = c[k] - e - PT(0.3);                 // тейк чуть раньше уровня
+      if(dd < InpTPMin || dd > InpTPMax || dd < InpMinRR * dist) continue;
+      if(dd < best) { best = dd; src = cn[k]; }
+     }
+   if(best < DBL_MAX) return best;
+   double fb = MathMin(InpTPMax, MathMax(InpTPMin, InpRRTarget * dist));
+   src = StringFormat("целей нет — стоп × %.1f", InpRRTarget);
+   return fb;
   }
 
 //+------------------------------------------------------------------+
@@ -987,15 +1036,21 @@ void GenFU(ENUM_TIMEFRAMES tf, int d, SCand &c[])
      }
   }
 
-void AddLiq(int d, double price)
+void AddLiq(int d, double price, bool major)
   {
    for(int k = 0; k < ArraySize(g_liq); k++)
-      if(g_liqDir[k] == d && MathAbs(g_liq[k] - price) < PT(0.05)) return;
+      if(g_liqDir[k] == d && MathAbs(g_liq[k] - price) < PT(0.05))
+        {
+         if(major) g_liqMajor[k] = true;
+         return;
+        }
    int n = ArraySize(g_liq);
    ArrayResize(g_liq, n + 1);
    ArrayResize(g_liqDir, n + 1);
+   ArrayResize(g_liqMajor, n + 1);
    g_liq[n] = price;
    g_liqDir[n] = d;
+   g_liqMajor[n] = major;
   }
 
 // Источник 3: ещё не снятая ликвидность (равные уровни, swing, Doji) -> зона за уровнем
@@ -1015,7 +1070,6 @@ void GenLiq(ENUM_TIMEFRAMES tf, int d, SCand &c[])
       for(int k = 1; k < i; k++)
          if(Lv(r, k, d) < L) { swept = true; break; }
       if(swept) continue;
-      AddLiq(d, d * L);
       int pts = 2;
       string nm = d > 0 ? (sw ? "SWL" : "DOJI") : (sw ? "SWH" : "DOJI");
       if(sw)
@@ -1032,6 +1086,7 @@ void GenLiq(ENUM_TIMEFRAMES tf, int d, SCand &c[])
               }
            }
         }
+      AddLiq(d, d * L, pts == 3 || dj);
       double lo = L - InpSweepZone, hi = L + PT(1.0);
       if(!NearWide(d, lo, hi)) continue;
       AddCand(c, 3, tf, lo, hi, t0, pts, false, L, StringFormat("%s %s %s", TFName(tf), nm, Px(d * L)));
@@ -1206,6 +1261,7 @@ void RebuildZones()
    g_rebuildId++;
    ArrayResize(g_liq, 0);
    ArrayResize(g_liqDir, 0);
+   ArrayResize(g_liqMajor, 0);
    for(int s = 0; s < 2; s++)
      {
       int d = s == 0 ? 1 : -1;
@@ -1303,6 +1359,7 @@ int TrigPts(string trig, bool strong)
    if(trig == "A") return 1;
    if(trig == "B") return 2;
    if(trig == "C") return strong ? 2 : 0;
+   if(trig == "K") return 1;
    return 0;
   }
 
@@ -1345,9 +1402,10 @@ bool TriggerA(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    if(!(Cv(r, 1, d) > prevLow)) { AddWhy(why, "A: нет закрытия обратно за " + Px(d * prevLow)); return false; }
    int cls = MathMax(FUClass(r, 1, d), FUClass(r, jp, d));
    if(cls < 1 && (IsLowerWick(r, jp, d) || IsLowerWick(r, 1, d))) cls = 1;
-   if(cls < (int)InpMinFUClass)
+   int need = Relaxed() ? 1 : (int)InpMinFUClass;
+   if(cls < need)
      {
-      AddWhy(why, StringFormat("A: FU класс %s < %s", ClsName(cls), ClsName((int)InpMinFUClass)));
+      AddWhy(why, StringFormat("A: FU класс %s < %s", ClsName(cls), ClsName(need)));
       return false;
      }
    FillSig(s, "A", cls, false, pierce, "FU", r[1].time);
@@ -1445,6 +1503,82 @@ bool TriggerE(const SZone &z, const MqlRates &r[], SSig &s, string &why)
    return true;
   }
 
+// Книга «Oddiy savdo kitobi»: молот (d=+1) / падающая звезда (d=-1) — маленькое тело,
+// длинная тень в сторону зоны, противоположная тень короткая
+bool IsPin(const MqlRates &r[], int i, int d)
+  {
+   double rg = Rng(r, i, d);
+   if(rg <= 0) return false;
+   double body = BTop(r, i, d) - BBot(r, i, d);
+   double tail = BBot(r, i, d) - Lv(r, i, d);
+   double nose = Hv(r, i, d) - BTop(r, i, d);
+   return body <= 0.35 * rg && tail >= 2.0 * body && tail >= 0.55 * rg && nose <= 0.2 * rg;
+  }
+
+// Книга: утренняя (d=+1) / вечерняя (d=-1) звезда на свечах [3], [2], [1]
+bool IsStar3(const MqlRates &r[], int d)
+  {
+   double rg3 = Rng(r, 3, d), b3 = BTop(r, 3, d) - BBot(r, 3, d);
+   if(rg3 <= 0 || b3 < 0.5 * rg3 || !(Cv(r, 3, d) < Ov(r, 3, d))) return false;
+   double b2 = BTop(r, 2, d) - BBot(r, 2, d);
+   if(b2 > 0.35 * b3) return false;
+   if(!(Cv(r, 1, d) > Ov(r, 1, d))) return false;
+   return Cv(r, 1, d) > (Ov(r, 3, d) + Cv(r, 3, d)) / 2.0;
+  }
+
+// K: свечные модели из книги, только внутри зоны Mr. Casino
+bool TriggerK(const SZone &z, const MqlRates &r[], SSig &s, string &why)
+  {
+   int d = z.dir;
+   if(ArraySize(r) < 6) return false;
+   double zl = ZLo(z), zh = ZHi(z);
+   double ext = 0;
+   // молот / падающая звезда: по книге вход после свечи-подтверждения
+   if(InpBookConfirm)
+     {
+      if(IsPin(r, 2, d) && Cv(r, 1, d) > Ov(r, 1, d) && Cv(r, 1, d) > BTop(r, 2, d))
+        {
+         ext = MathMin(Lv(r, 2, d), Lv(r, 1, d));
+         if(ext >= zl - InpPierceMax && ext <= zh)
+           {
+            FillSig(s, "K", MathMax(FUClass(r, 2, d), 1), false, ext, d > 0 ? "HAMMER" : "STAR", r[1].time);
+            return true;
+           }
+        }
+     }
+   else if(IsPin(r, 1, d))
+     {
+      ext = Lv(r, 1, d);
+      if(ext >= zl - InpPierceMax && ext <= zh)
+        {
+         FillSig(s, "K", MathMax(FUClass(r, 1, d), 1), false, ext, d > 0 ? "HAMMER" : "STAR", r[1].time);
+         return true;
+        }
+     }
+   // поглощение
+   if(Cv(r, 2, d) < Ov(r, 2, d) && IsEngulf(r, 1, d))
+     {
+      ext = MathMin(Lv(r, 1, d), Lv(r, 2, d));
+      if(ext >= zl - InpPierceMax && ext <= zh)
+        {
+         FillSig(s, "K", MathMax(FUClass(r, 1, d), 1), false, ext, "ENGULF", r[1].time);
+         return true;
+        }
+     }
+   // утренняя / вечерняя звезда
+   if(IsStar3(r, d))
+     {
+      ext = MathMin(Lv(r, 1, d), MathMin(Lv(r, 2, d), Lv(r, 3, d)));
+      if(ext >= zl - InpPierceMax && ext <= zh)
+        {
+         FillSig(s, "K", MathMax(FUClass(r, 1, d), 1), false, ext, d > 0 ? "MSTAR" : "ESTAR", r[1].time);
+         return true;
+        }
+     }
+   AddWhy(why, "K: нет модели из книги");
+   return false;
+  }
+
 // Прямой вход: BIW, за которым сразу Doji
 bool TriggerDirect(const SZone &z, const MqlRates &r[], SSig &s)
   {
@@ -1476,13 +1610,14 @@ bool EvalZone(SZone &z, const MqlRates &r[], SSig &s, string &why)
    t.ok = false;
    if(InpUseTrigC && TriggerC(z, r, t, w) && t.pts > best.pts) best = t;
    t.ok = false;
+   if(InpUseBook && TriggerK(z, r, t, w) && t.pts > best.pts) best = t;
    t.ok = false;
-   if(InpUseTrigE && !best.ok && TriggerE(z, r, t, w)) best = t;
+   if((InpUseTrigE || Relaxed()) && !best.ok && TriggerE(z, r, t, w)) best = t;
    t.ok = false;
    if(InpDirectEntry && !best.ok && TriggerDirect(z, r, t)) best = t;
    if(!best.ok)
      {
-      why = w == "" ? "нет триггера (A, B, C, D)" : w;
+      why = w == "" ? "нет триггера (A, B, C, D, K)" : w;
       return false;
      }
    s = best;
@@ -1733,15 +1868,15 @@ void DrawPanel()
   {
    if(!InpDraw) return;
    double sp = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
-   Comment("Mr. Casino v2.5\n",
+   Comment("Mr. Casino v3 (золото)\n",
            "Bias: D1=", BiasName(g_d1), "  H4=", BiasName(g_h4), "\n",
-           "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")\n",
+           "Сессия: ", InSession() ? "открыта" : "закрыта", " (Бишкек ", LocalHM(), ")", Relaxed() ? " · добор" : "", "\n",
            "SELL-зона: ", NearestZoneText(-1), "\n",
            "BUY-зона: ", NearestZoneText(1), "\n",
-           "Риск: ", EnumToString(EffectiveRiskMode()), "\n",
-           g_k != 1.0 ? StringFormat("Масштаб ×%.0f: стоп %.0f–%.0f, тейк %.0f\n", g_k, InpMinSL, InpMaxSL, InpTP) : "",
+           "Риск: ", EnumToString(EffectiveRiskMode()), ", лот ", DoubleToString(InpFixedLot, 2), "\n",
+           StringFormat("Стоп %.0f–%.0f · тейк %.0f–%.0f (LAL, RR от %.1f)\n", InpMinSL, InpMaxSL, InpTPMin, InpTPMax, InpMinRR),
            "Сделок сегодня: ", g_day.trades, " / ", InpMaxTradesDay, "  (COUNTER ", g_day.counter, ")\n",
-           "Пунктов за день: ", DoubleToString(g_day.pts, 1), " / ", DoubleToString(InpDailyTarget, 0), "\n",
+           "Пунктов за день: ", DoubleToString(g_day.pts, 1), "\n",
            "Спред: ", DoubleToString(sp, 2), "\n",
            "Пропуск: ", g_lastSkip);
   }
@@ -1755,7 +1890,7 @@ string GlobalBlock()
    if(FridayCloseTime()) return "пятница, закрытие рынка";
    if(!InSession()) return "вне сессии (Бишкек " + LocalHM() + ")";
    if(g_day.trades >= InpMaxTradesDay) return StringFormat("лимит сделок дня %d", InpMaxTradesDay);
-   if(g_day.pts >= InpDailyTarget) return StringFormat("дневная цель %.1f pt", g_day.pts);
+   if(InpDailyTarget > 0 && g_day.pts >= InpDailyTarget) return StringFormat("дневная цель %.1f pt", g_day.pts);
    if(g_day.lossStreak >= InpMaxLossStreak) return StringFormat("%d стопа подряд, пауза до завтра", g_day.lossStreak);
    if(NewsBlock()) return "окно новостей";
    double spread = SymbolInfoDouble(g_sym, SYMBOL_ASK) - SymbolInfoDouble(g_sym, SYMBOL_BID);
@@ -1770,6 +1905,23 @@ void Skip(int zi, string why)
    g_zones[zi].lastSkip = why;
    g_zones[zi].lastSkipT = TimeCurrent();
    Lg(1, "Пропуск " + ZoneTag(g_zones[zi]) + ": " + why);
+  }
+
+// Книга (FOMO): цена влетела в зону импульсом — 3 свечи подряд против сделки на InpImpulse+ пунктов.
+// Не ловим нож, ждём ретест.
+bool ImpulseInto(const MqlRates &r[], int d)
+  {
+   if(InpImpulse <= 0 || ArraySize(r) < 6) return false;
+   for(int i = 2; i <= 4; i++)
+      if(!(Cv(r, i, d) < Ov(r, i, d))) return false;
+   return Hv(r, 4, d) - MathMin(Lv(r, 2, d), Lv(r, 1, d)) >= InpImpulse;
+  }
+
+// Безубыток после доли пути до тейка
+double BEAt(double tpDist)
+  {
+   if(InpBEFrac <= 0 || tpDist <= 0) return DBL_MAX;
+   return InpBEFrac * tpDist;
   }
 
 bool InRegion(const SZone &z, const MqlRates &r[])
@@ -1821,29 +1973,37 @@ void TryEntry()
    int d = g_zones[bi].dir;
    SZone z = g_zones[bi];
    if(InsideFVG(r)) { Skip(bi, "сигнальная свеча внутри незакрытого FVG (триггер " + bs.trig + ")"); return; }
+   if(InpDojiWait && bs.trig != "DIRECT" && IsDoji(r, 1))
+     { Skip(bi, "сигнальная свеча Doji — ждём (книга, триггер " + bs.trig + ")"); return; }
+   if(ImpulseInto(r, d))
+     { Skip(bi, StringFormat("импульс в зону %.0f+ за 3 свечи — ждём ретест (книга, триггер %s)", InpImpulse, bs.trig)); return; }
 
    double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK), bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
    double spread = ask - bid;
    double entry = d > 0 ? ask : bid;
    double buf = spread + InpSLBuffer;
-   double sl = d * bs.ext - d * buf;
+   double sl = d * bs.ext - d * buf;                     // за манипуляцией
    double dist = d * (entry - sl);
+   string slSrc = "за манипуляцией";
+   if(InpTrueStop)                                       // True Stop: за дальним краем зоны [§10]
+     {
+      double slZ = (d > 0 ? z.lo : z.hi) - d * buf;
+      double distZ = d * (entry - slZ);
+      if(distZ > dist && distZ <= InpMaxSL) { sl = slZ; dist = distZ; slSrc = "True Stop за зоной"; }
+     }
    double minDist = MathMax(MinStopDist(), InpMinSL);
-   if(dist < minDist) { dist = minDist; sl = entry - d * dist; }
+   if(dist < minDist) { dist = minDist; sl = entry - d * dist; slSrc += ", мин. стоп"; }
    if(dist > InpMaxSL)
      { Skip(bi, StringFormat("стоп %.1f > %.1f (триггер %s)", dist, InpMaxSL, bs.trig)); return; }
 
-   double major = FindMajorLiq(d, entry);
-   string obSrc;
-   double obst = NearestObstacle(d, entry, major, obSrc);
-   double tpDist = InpTP;
-   if(InpCapTP && obst > 0 && obst - PT(1.0) < tpDist) tpDist = obst - PT(1.0);
+   string tpSrc = "";
+   double tpDist = ChooseTP(d, entry, dist, tpSrc);
    if(tpDist < MinStopDist() || tpDist / dist < InpMinRR)
      {
-      Skip(bi, StringFormat("RR %.1f < %.1f (тейк %.1f, стоп %.1f%s)", tpDist / dist, InpMinRR, tpDist, dist,
-                            obSrc != "" ? ", препятствие: " + obSrc : ""));
+      Skip(bi, StringFormat("RR %.1f < %.1f (тейк %.1f, стоп %.1f, %s)", tpDist / dist, InpMinRR, tpDist, dist, tpSrc));
       return;
      }
+   double major = FindMajorLiq(d, entry);
 
    sl = NormalizeDouble(sl, g_digits);
    double tp = NormalizeDouble(entry + d * tpDist, g_digits);
@@ -1851,7 +2011,7 @@ void TryEntry()
    if(lot <= 0) { Skip(bi, "не хватает маржи на минимальный лот"); return; }
 
    string tname = TypeName(btype);
-   string cmt = "MC " + bs.trig + " " + tname;
+   string cmt = "MC " + bs.trig + " " + tname + (Relaxed() ? " Q" : "");
    bool ok = d > 0 ? g_trade.Buy(lot, g_sym, 0.0, sl, tp, cmt) : g_trade.Sell(lot, g_sym, 0.0, sl, tp, cmt);
    uint rc = g_trade.ResultRetcode();
    if(!ok || (rc != TRADE_RETCODE_DONE && rc != TRADE_RETCODE_PLACED))
@@ -1868,7 +2028,7 @@ void TryEntry()
    g_pStrength = Stars(total);
    g_pEntry = po; g_pSL = psl; g_pTP = ptp; g_pLot = pv; g_pLal = major;
    g_pZoneW = z.hi - z.lo; g_pZLo = z.lo; g_pZHi = z.hi;
-   g_pBEAt = MathMin(InpBEAt, 0.5 * MathAbs(ptp - po));
+   g_pBEAt = BEAt(MathAbs(ptp - po));
    g_beDone = false; g_partDone = false; g_exitTag = ""; g_closeRetry = 0;
    SetStatus(g_zones[bi], ZONE_USED, "сделка");
    if(btype == T_COUNTER) g_cntToday++;
@@ -1876,6 +2036,7 @@ void TryEntry()
 
    Lg(0, StringFormat("СДЕЛКА %s | триггер %s | тип %s | балл зоны %d | вход %s SL %s TP %s | лот %.2f | сессия %s | %s",
                       ZoneTag(z), bs.trig, tname, z.score, Px(po), Px(psl), Px(ptp), pv, g_pSess, z.srcs));
+   Lg(0, StringFormat("Стоп %.1f (%s) | тейк %.1f (%s) | RR 1:%.1f", dist, slSrc, tpDist, tpSrc, tpDist / dist));
 
    DrawMark(bs.t, d > 0 ? r[1].low : r[1].high, bs.mark, d > 0 ? clrLime : clrRed);
    DrawLine("SL", psl, clrRed);
@@ -1883,9 +2044,9 @@ void TryEntry()
    DrawZones();
    DrawPanel();
 
-   Notify(StringFormat("%s %s · %s\nEntry: %s\nSL: %s\nTP: %s\nRR: 1:%.1f\n\n✅ Зона %s–%s · балл %d\n✅ %s\n✅ Триггер %s (%s), FU класс %s\n%sТФ: M5 · сессия %s\nSignal Strength: %s",
+   Notify(StringFormat("%s %s · %s\nEntry: %s\nSL: %s\nTP: %s (%s)\nRR: 1:%.1f\n\n✅ Зона %s–%s · балл %d\n✅ %s\n✅ Триггер %s (%s), FU класс %s\n%sТФ: M5 · сессия %s\nSignal Strength: %s",
                        g_sym, DirName(d), tname,
-                       Px(po), Px(psl), Px(ptp),
+                       Px(po), Px(psl), Px(ptp), tpSrc,
                        MathAbs(ptp - po) / MathMax(MathAbs(po - psl), 0.01),
                        Px(z.lo), Px(z.hi), z.score, z.srcs, bs.trig, bs.mark, ClsName(bs.cls),
                        z.htf ? "✅ HTF Re-test Level\n" : "", g_pSess, Stars(total)));
@@ -1980,7 +2141,7 @@ void ManagePosition()
       g_pScore = 0; g_pSrcs = "-"; g_pSess = "-";
       g_pEntry = op; g_pSL = sl; g_pTP = tp; g_pLot = vol;
       g_pLal = 0; g_beDone = d * (sl - op) >= 0; g_partDone = false; g_exitTag = ""; g_closeRetry = 0;
-      g_pBEAt = MathMin(InpBEAt, tp > 0 ? 0.5 * MathAbs(tp - op) : InpBEAt);
+      g_pBEAt = BEAt(tp > 0 ? MathAbs(tp - op) : 0);
      }
    if(FridayCloseTime()) { ClosePosNow(tk, "FRIDAY"); return; }
 
@@ -1988,7 +2149,7 @@ void ManagePosition()
    double cur = d > 0 ? bid : ask;
    double profit = d * (cur - op);
 
-   // безубыток: меньшее из InpBEAt и 50% пути до тейка
+   // безубыток: после доли InpBEFrac пути до тейка
    if(!g_beDone && profit >= g_pBEAt)
      {
       double nsl = NormalizeDouble(op + d * InpBEOffset, g_digits);
@@ -2076,15 +2237,18 @@ int OnInit()
    g_isTester = (bool)MQLInfoInteger(MQL_TESTER);
    string up = g_sym;
    StringToUpper(up);
-   g_crypto = StringFind(up, "BTC") >= 0;
-   bool gold = StringFind(up, "XAU") >= 0 || StringFind(up, "GOLD") >= 0;
-   if(InpPointScale > 0) g_k = InpPointScale;
-   else g_k = g_crypto ? 40.0 : 1.0;
-   g_ks = g_k > 1.5 ? g_k * 1.5 : g_k;
-   if(InpPointScale <= 0 && !gold && !g_crypto)
-      Print("Внимание: ", g_sym, " — не золото и не BTC. Расстояния заданы для золота, укажите «Масштаб пунктов» вручную.");
-   Print(StringFormat("Масштаб ×%.1f: зона %.1f–%.1f, стоп %.1f–%.1f, тейк %.1f, безубыток +%.1f, макс. спред %.2f",
-                      g_k, InpZoneMin, InpZoneMax, InpMinSL, InpMaxSL, InpTP, InpBEAt, InpMaxSpread));
+   if(StringFind(up, "XAU") < 0 && StringFind(up, "GOLD") < 0)
+     {
+      Print("Mr. Casino v3 торгует только золото (XAUUSD / GOLD#). Символ графика: ", g_sym, " — робот не запущен.");
+      return INIT_FAILED;
+     }
+   g_k = 1.0;
+   g_ks = 1.0;
+   g_crypto = false;
+   g_quotaMin = ParseHM(InpQuotaFrom);
+   Print(StringFormat("Стоп %.1f–%.1f (True Stop %s), тейк %.1f–%.1f (LAL, RR от %.1f; без цели стоп × %.1f), безубыток после %.2f пути, сделок в день %d, добор с %s",
+                      InpMinSL, InpMaxSL, InpTrueStop ? "вкл" : "выкл", InpTPMin, InpTPMax, InpMinRR, InpRRTarget, InpBEFrac,
+                      InpMaxTradesDay, InpQuotaFrom));
    g_sessStart = ParseHM(InpSessionStart);
    g_sessEnd = ParseHM(InpSessionEnd);
    g_londonMin = ParseHM(InpLondonStart);
@@ -2106,7 +2270,7 @@ int OnInit()
    g_lastM5 = 0; g_lastM15 = 0; g_lastH1 = 0;
    g_day = CalcDay();
    ManagePosition();
-   Print("Mr. Casino v2.5 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
+   Print("Mr. Casino v3 запущен: ", g_sym, ", риск ", EnumToString(EffectiveRiskMode()), ", магик ", InpMagic,
          ", лог-уровень ", InpLogLevel, ", Бишкек ", LocalHM());
    return INIT_SUCCEEDED;
   }
